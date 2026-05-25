@@ -50,6 +50,32 @@ func TestBridgeCommandEncodesSwiftKeyValuePayload(t *testing.T) {
 	}
 }
 
+func TestGrantHandlesSwiftPermissionObject(t *testing.T) {
+	var grant Grant
+	if err := DecodeJSON([]byte(`{"name":"Feed grant","keypath":"feed","permission":{"group":4,"other":0}}`), &grant); err != nil {
+		t.Fatal(err)
+	}
+	if grant.Permission != "r--" {
+		t.Fatalf("permission = %q", grant.Permission)
+	}
+
+	data, err := json.Marshal(NewGrant("", "feed", "rw--"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded map[string]any
+	if err := DecodeJSON(data, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	permission, ok := encoded["permission"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected Swift Permission object, got %#v", encoded["permission"])
+	}
+	if permission["group"] != json.Number("6") || permission["other"] != json.Number("0") {
+		t.Fatalf("unexpected permission bits: %#v", permission)
+	}
+}
+
 func TestBridgeEndpointHandlesGetSetDescription(t *testing.T) {
 	ctx := context.Background()
 	cell := NewGeneralCell(nil, "Echo")

@@ -25,7 +25,7 @@ func NewRemoteCellHostRoute() RemoteCellHostRoute {
 	return RemoteCellHostRoute{
 		WebSocketEndpoint: "bridgehead",
 		SchemePreference:  "automatic",
-		PathLayout:        "endpointThenPublisherUUID",
+		PathLayout:        "publisherUUIDThenEndpoint",
 	}
 }
 
@@ -54,7 +54,7 @@ func (r RemoteCellHostRoute) BridgePath(endpoint, publisherUUID string) string {
 		prefix = "bridgehead"
 	}
 	endpoint = strings.Trim(endpoint, "/")
-	if r.PathLayout == "publisherUUIDThenEndpoint" {
+	if r.PathLayout == "" || r.PathLayout == "publisherUUIDThenEndpoint" {
 		return "/" + prefix + "/" + publisherUUID + "/" + endpoint
 	}
 	return "/" + prefix + "/" + endpoint + "/" + publisherUUID
@@ -140,7 +140,7 @@ type CellResolver struct {
 	named                    map[string]*CellResolve
 	byUUID                   map[string]CellProtocol
 	remoteHosts              map[string]RemoteCellHostRoute
-	remoteCache              map[string]*BridgeBase
+	remoteCache              map[string]*CloudBridge
 }
 
 func NewCellResolver() *CellResolver {
@@ -148,7 +148,7 @@ func NewCellResolver() *CellResolver {
 		named:       map[string]*CellResolve{},
 		byUUID:      map[string]CellProtocol{},
 		remoteHosts: map[string]RemoteCellHostRoute{},
-		remoteCache: map[string]*BridgeBase{},
+		remoteCache: map[string]*CloudBridge{},
 	}
 }
 
@@ -398,7 +398,9 @@ func (r *CellResolver) remoteBridge(bridgeURL string, requester *Identity) CellP
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.remoteCache[key] == nil {
-		r.remoteCache[key] = NewBridgeBase(nil, requester)
+		r.remoteCache[key] = NewCloudBridge(bridgeURL, requester, CloudBridgeOptions{
+			AllowInsecureWebSocket: r.allowsInsecureWebSockets,
+		})
 	}
 	return r.remoteCache[key]
 }

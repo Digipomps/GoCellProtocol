@@ -5,6 +5,7 @@ package cellprotocol
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -40,6 +41,65 @@ func NewGrant(name, keypath, permission string) Grant {
 	return Grant{UUID: NewUUID(), Name: name, Keypath: keypath, Permission: permission}
 }
 
+func (g Grant) MarshalJSON() ([]byte, error) {
+	type grantJSON struct {
+		UUID       string `json:"uuid"`
+		Name       string `json:"name"`
+		Keypath    string `json:"keypath"`
+		Permission any    `json:"permission"`
+	}
+	permission := any(g.Permission)
+	if group, other, ok := permissionBits(g.Permission); ok {
+		permission = map[string]any{
+			"group": group,
+			"other": other,
+		}
+	}
+	return json.Marshal(grantJSON{
+		UUID:       g.UUID,
+		Name:       g.Name,
+		Keypath:    g.Keypath,
+		Permission: permission,
+	})
+}
+
+func (g *Grant) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		UUID       string          `json:"uuid"`
+		Name       string          `json:"name"`
+		Keypath    string          `json:"keypath"`
+		Permission json.RawMessage `json:"permission"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	g.UUID = raw.UUID
+	if g.UUID == "" {
+		g.UUID = NewUUID()
+	}
+	g.Name = raw.Name
+	if g.Name == "" {
+		g.Name = "Condition grant"
+	}
+	g.Keypath = raw.Keypath
+	g.Permission = ""
+	if len(raw.Permission) == 0 || string(raw.Permission) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(raw.Permission, &g.Permission); err == nil {
+		return nil
+	}
+	var permission struct {
+		Group int `json:"group"`
+		Other int `json:"other"`
+	}
+	if err := json.Unmarshal(raw.Permission, &permission); err != nil {
+		return err
+	}
+	g.Permission = permissionString(permission.Group, permission.Other)
+	return nil
+}
+
 func (g Grant) Grants(requested Grant) bool {
 	if !grantKeypathMatches(g.Keypath, requested.Keypath) {
 		return false
@@ -65,6 +125,77 @@ func (g Grant) Grants(requested Grant) bool {
 		}
 	}
 	return true
+}
+
+func permissionBits(permission string) (int, int, bool) {
+	trimmed := strings.TrimSpace(permission)
+	if len(trimmed) == 4 && strings.HasSuffix(trimmed, "-") {
+		trimmed = trimmed[:3]
+	}
+	if len(trimmed) == 3 {
+		group, ok := permissionTripletBits(trimmed)
+		return group, 0, ok
+	}
+	if len(trimmed) == 6 {
+		group, ok := permissionTripletBits(trimmed[:3])
+		if !ok {
+			return 0, 0, false
+		}
+		other, ok := permissionTripletBits(trimmed[3:])
+		return group, other, ok
+	}
+	return 0, 0, false
+}
+
+func permissionTripletBits(permission string) (int, bool) {
+	if len(permission) != 3 {
+		return 0, false
+	}
+	bits := 0
+	if permission[0] == 'r' {
+		bits += 4
+	} else if permission[0] != '-' {
+		return 0, false
+	}
+	if permission[1] == 'w' {
+		bits += 2
+	} else if permission[1] != '-' {
+		return 0, false
+	}
+	if permission[2] == 'x' {
+		bits += 1
+	} else if permission[2] != '-' {
+		return 0, false
+	}
+	return bits, true
+}
+
+func permissionString(group, other int) string {
+	groupString := permissionTripletString(group)
+	if other == 0 {
+		return groupString
+	}
+	return groupString + permissionTripletString(other)
+}
+
+func permissionTripletString(bits int) string {
+	var builder strings.Builder
+	if bits&4 == 4 {
+		builder.WriteByte('r')
+	} else {
+		builder.WriteByte('-')
+	}
+	if bits&2 == 2 {
+		builder.WriteByte('w')
+	} else {
+		builder.WriteByte('-')
+	}
+	if bits&1 == 1 {
+		builder.WriteByte('x')
+	} else {
+		builder.WriteByte('-')
+	}
+	return builder.String()
 }
 
 func grantKeypathMatches(grant, requested string) bool {

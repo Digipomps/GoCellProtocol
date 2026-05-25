@@ -82,7 +82,11 @@ func (i *Identity) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	if i.PublicSecureKey != "" {
+		out["publicSecureKey"] = swiftSecureKeyJSON(i.PublicSecureKey, "signature")
 		out["publicKey"] = i.PublicSecureKey
+	}
+	if i.PublicKeyAgreementSecureKey != "" {
+		out["publicKeyAgreementSecureKey"] = swiftSecureKeyJSON(i.PublicKeyAgreementSecureKey, "keyAgreement")
 	}
 	return json.Marshal(out)
 }
@@ -109,10 +113,14 @@ func (i *Identity) UnmarshalJSON(data []byte) error {
 	}
 	if key, ok := payload["publicSecureKey"].(string); ok {
 		i.PublicSecureKey = key
+	} else if key, ok := secureKeyCompressedKey(payload["publicSecureKey"]); ok {
+		i.PublicSecureKey = key
 	} else if key, ok := payload["publicKey"].(string); ok {
 		i.PublicSecureKey = key
 	}
 	if key, ok := payload["publicKeyAgreementSecureKey"].(string); ok {
+		i.PublicKeyAgreementSecureKey = key
+	} else if key, ok := secureKeyCompressedKey(payload["publicKeyAgreementSecureKey"]); ok {
 		i.PublicKeyAgreementSecureKey = key
 	}
 	if props, ok := ObjectValue(payload["properties"]); ok {
@@ -122,6 +130,31 @@ func (i *Identity) UnmarshalJSON(data []byte) error {
 	}
 	i.EntityAnchorReference = "cell:///EntityAnchor"
 	return nil
+}
+
+func swiftSecureKeyJSON(compressedKey, use string) map[string]any {
+	algorithm := "EdDSA"
+	if use == "keyAgreement" {
+		algorithm = "X25519"
+	}
+	return map[string]any{
+		"date":          0,
+		"privateKey":    false,
+		"use":           use,
+		"algorithm":     algorithm,
+		"size":          32,
+		"curveType":     "Curve25519",
+		"compressedKey": compressedKey,
+	}
+}
+
+func secureKeyCompressedKey(value any) (string, bool) {
+	object, ok := ObjectValue(value)
+	if !ok {
+		return "", false
+	}
+	key, ok := object["compressedKey"].(string)
+	return key, ok && key != ""
 }
 
 type InMemoryIdentityVault struct {

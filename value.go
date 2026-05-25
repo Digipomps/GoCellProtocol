@@ -287,6 +287,27 @@ func PayloadFromBridgeJSON(key string, value any) (TypedValue, error) {
 			return TypedValue{}, err
 		}
 		return TypedValue{Kind: kind, Value: response}, nil
+	case "flowElement":
+		data, _ := StableJSON(value)
+		var flow FlowElement
+		if err := DecodeJSON(data, &flow); err != nil {
+			return TypedValue{}, err
+		}
+		return TypedValue{Kind: kind, Value: flow}, nil
+	case "cellConfiguration":
+		data, _ := StableJSON(value)
+		var configuration CellConfiguration
+		if err := DecodeJSON(data, &configuration); err != nil {
+			return TypedValue{}, err
+		}
+		return TypedValue{Kind: kind, Value: configuration}, nil
+	case "cellReference":
+		data, _ := StableJSON(value)
+		var reference CellReference
+		if err := DecodeJSON(data, &reference); err != nil {
+			return TypedValue{}, err
+		}
+		return TypedValue{Kind: kind, Value: reference}, nil
 	case "data", "signData", "signature":
 		s, ok := value.(string)
 		if !ok {

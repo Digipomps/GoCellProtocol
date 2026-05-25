@@ -12,6 +12,7 @@ names:
 - append-only ordered flows, replay checks, and an in-memory scaffold runtime
 - capability grants, agreements, conditions, and explicit access rejection
 - Swift/Python-compatible bridge commands and typed payload keys
+- `CloudBridge` WebSocket client for Swift/Vapor bridgeheads and staging probes
 - `CellConfiguration`, `CellReference`, and Skeleton wrapper JSON parsing
 - pragmatic built-in cells: Vault, GraphIndex, EntityAnchor, TrustedIssuers proxy,
   and FunctionCell
@@ -24,9 +25,27 @@ go test ./...
 
 ## Compatibility Scope
 
-The package is transport-neutral. WebSocket/QUIC/WebRTC sessions can wrap
-`BridgeCommand` and `BridgeEndpoint`, but this repository does not bind the core
-protocol to a network stack.
+The package is transport-neutral at the protocol level. `CloudBridge` provides a
+WebSocket client for the current Swift/Vapor bridgehead contract:
+
+```go
+bridge := cellprotocol.NewCloudBridge(
+    "wss://staging.example.org/bridgehead/client-uuid/ConfigurationCatalog",
+    identity,
+    cellprotocol.DefaultCloudBridgeOptions(),
+)
+value, err := bridge.Get(ctx, "state", identity)
+```
+
+`ws://` is rejected by default. Enable `AllowInsecureWebSocket` only for local
+development.
+
+Live Swift/Vapor bridgehead smoke test:
+
+```bash
+CELLPROTOCOL_STAGING_BRIDGE_URL=wss://staging.haven.digipomps.org/bridgehead/<client-uuid>/ConfigurationCatalog \
+  go test ./... -run TestCloudBridgeStagingSmoke -count=1
+```
 
 The Skeleton model is parsed and round-tripped as portable JSON. Go does not ship
 a UI renderer in this repository.

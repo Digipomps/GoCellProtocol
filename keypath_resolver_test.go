@@ -75,8 +75,13 @@ func TestResolverScopesAndRemoteRouteLayouts(t *testing.T) {
 	}
 	defaultRoute := RemoteCellHostRoute{WebSocketEndpoint: "bridgehead", SchemePreference: "wss"}
 	url, _ = defaultRoute.BridgeURL("example.test", "LoginCell", "bridge-uuid", false)
-	if url != "wss://example.test/bridgehead/LoginCell/bridge-uuid" {
+	if url != "wss://example.test/bridgehead/bridge-uuid/LoginCell" {
 		t.Fatalf("default route = %s", url)
+	}
+	legacyRoute := RemoteCellHostRoute{WebSocketEndpoint: "bridgehead", SchemePreference: "wss", PathLayout: "endpointThenPublisherUUID"}
+	url, _ = legacyRoute.BridgeURL("example.test", "LoginCell", "bridge-uuid", false)
+	if url != "wss://example.test/bridgehead/LoginCell/bridge-uuid" {
+		t.Fatalf("legacy route = %s", url)
 	}
 }
 
