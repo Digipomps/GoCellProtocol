@@ -47,6 +47,14 @@ CELLPROTOCOL_STAGING_BRIDGE_URL=wss://staging.haven.digipomps.org/bridgehead/<cl
   go test ./... -run TestCloudBridgeStagingSmoke -count=1
 ```
 
+## Upstream Monitoring
+
+The `CellProtocol Upstream Monitor` GitHub Actions workflow checks
+`Digipomps/CellProtocol` daily. If the Swift upstream default branch moves past
+the recorded SHA in `.github/upstream/cellprotocol.json`, it opens an issue in
+this repository with the new commit and update checklist. After the Go port has
+been updated, update that baseline file in the same commit.
+
 The Skeleton model is parsed and round-tripped as portable JSON. Go does not ship
 a UI renderer in this repository.
 

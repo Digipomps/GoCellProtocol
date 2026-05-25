@@ -1,0 +1,92 @@
+name: CellProtocol Upstream Monitor
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force_issue:
+        description: "Open an issue even when the recorded upstream SHA matches"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: cellprotocol-upstream-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check CellProtocol upstream
+        env:
+          GH_TOKEN: ${{ secrets.CELLPROTOCOL_MONITOR_TOKEN || github.token }}
+          BASELINE_FILE: .github/upstream/cellprotocol.json
+          FORCE_ISSUE: ${{ inputs.force_issue || false }}
+        run: |
+          set -euo pipefail
+
+          upstream_repo="$(jq -r '.repo' "${BASELINE_FILE}")"
+          baseline_sha="$(jq -r '.sha' "${BASELINE_FILE}")"
+          baseline_url="$(jq -r '.commitUrl // empty' "${BASELINE_FILE}")"
+          baseline_short="${baseline_sha:0:12}"
+
+          repo_json="$(gh api "repos/${upstream_repo}")"
+          upstream_branch="$(jq -r '.default_branch' <<<"${repo_json}")"
+          commit_json="$(gh api "repos/${upstream_repo}/commits/${upstream_branch}")"
+          latest_sha="$(jq -r '.sha' <<<"${commit_json}")"
+          latest_url="$(jq -r '.html_url' <<<"${commit_json}")"
+          latest_date="$(jq -r '.commit.committer.date' <<<"${commit_json}")"
+          latest_subject="$(jq -r '.commit.message | split("\n")[0]' <<<"${commit_json}")"
+          latest_short="${latest_sha:0:12}"
+
+          if [[ "${latest_sha}" == "${baseline_sha}" && "${FORCE_ISSUE}" != "true" ]]; then
+            echo "CellProtocol is still at recorded SHA ${baseline_sha}."
+            exit 0
+          fi
+
+          existing_issue="$(
+            gh issue list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --search "${latest_sha}" \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+          if [[ -n "${existing_issue}" ]]; then
+            echo "Open issue #${existing_issue} already tracks upstream SHA ${latest_sha}."
+            exit 0
+          fi
+
+          title="CellProtocol upstream changed: ${baseline_short} -> ${latest_short}"
+          body_file="$(mktemp)"
+          cat > "${body_file}" <<BODY
+          The Swift CellProtocol upstream has moved beyond the GoCellProtocol recorded baseline.
+
+          Upstream repo: ${upstream_repo}
+          Upstream branch: ${upstream_branch}
+          Recorded baseline: ${baseline_sha}
+          Recorded baseline URL: ${baseline_url}
+          Latest upstream SHA: ${latest_sha}
+          Latest upstream URL: ${latest_url}
+          Latest upstream date: ${latest_date}
+          Latest upstream subject: ${latest_subject}
+
+          Suggested update checklist:
+          - Review the Swift diff from the recorded baseline to the latest upstream commit.
+          - Port any protocol, bridge, identity, skeleton, resolver, or contract changes that affect GoCellProtocol.
+          - Run \`go test ./...\`, \`go vet ./...\`, and the staging CloudBridge smoke when bridge behavior is touched.
+          - Update \`${BASELINE_FILE}\` to the new upstream SHA in the GoCellProtocol commit that completes the port.
+          BODY
+
+          gh issue create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${title}" \
+            --body-file "${body_file}"
