@@ -78,11 +78,16 @@ type CellResolve struct {
 	Identity    *Identity
 	Persistancy Persistancy
 
+	mu                sync.Mutex
 	scaffoldInstance  CellProtocol
 	identityInstances map[string]CellProtocol
 }
 
 func (r *CellResolve) Resolve(ctx context.Context, requester *Identity) (CellProtocol, error) {
+	if r.Scope != ScopeTemplate {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+	}
 	switch r.Scope {
 	case ScopeTemplate:
 		return r.newInstance(ctx, requester)

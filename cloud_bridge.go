@@ -44,19 +44,20 @@ type CloudBridge struct {
 	options  CloudBridgeOptions
 	base     *BridgeBase
 
-	mu           sync.Mutex
-	socket       *webSocketClient
-	connecting   bool
-	connected    bool
-	closed       bool
-	readErr      error
-	pending      map[int]pendingBridgeResponse
-	feedCID      int
-	feedSinks    map[int]chan FlowElement
-	nextFeedSink int
-	ready        chan struct{}
-	readyOnce    sync.Once
-	closeOnce    sync.Once
+	mu                sync.Mutex
+	socket            *webSocketClient
+	connecting        bool
+	connected         bool
+	sessionReady      bool
+	closed            bool
+	readErr           error
+	pending           map[int]pendingBridgeResponse
+	feedCID           int
+	feedSinks         map[int]chan FlowElement
+	nextFeedSink      int
+	ready             chan struct{}
+	closeOnce         sync.Once
+	signingChallenges *signingChallengeReplayStore
 
 	cachedDescription *AnyCell
 }
@@ -73,12 +74,13 @@ func NewCloudBridge(endpoint string, identity *Identity, options CloudBridgeOpti
 		options.MaxMessageBytes = defaults.MaxMessageBytes
 	}
 	bridge := &CloudBridge{
-		endpoint:  endpoint,
-		identity:  identity,
-		options:   options,
-		pending:   map[int]pendingBridgeResponse{},
-		feedSinks: map[int]chan FlowElement{},
-		ready:     make(chan struct{}),
+		endpoint:          endpoint,
+		identity:          identity,
+		options:           options,
+		pending:           map[int]pendingBridgeResponse{},
+		feedSinks:         map[int]chan FlowElement{},
+		ready:             make(chan struct{}),
+		signingChallenges: newSigningChallengeReplayStore(),
 	}
 	bridge.base = NewBridgeBase(bridge.SendCommand, identity)
 	return bridge
@@ -115,6 +117,9 @@ func (b *CloudBridge) Connect(ctx context.Context) error {
 		}
 	}
 	b.connecting = true
+	b.readErr = nil
+	b.sessionReady = false
+	b.ready = make(chan struct{})
 	b.mu.Unlock()
 
 	socket, err := dialWebSocket(ctx, b.endpoint, webSocketDialOptions{
@@ -134,6 +139,7 @@ func (b *CloudBridge) Connect(ctx context.Context) error {
 	}
 	b.socket = socket
 	b.connected = true
+	b.sessionReady = false
 	b.readErr = nil
 	go b.readLoop()
 	return nil
@@ -143,8 +149,11 @@ func (b *CloudBridge) Ready(ctx context.Context) error {
 	if err := b.Connect(ctx); err != nil {
 		return err
 	}
+	b.mu.Lock()
+	ready := b.ready
+	b.mu.Unlock()
 	select {
-	case <-b.ready:
+	case <-ready:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -259,6 +268,7 @@ func (b *CloudBridge) CloseConnection() error {
 		socket := b.socket
 		b.socket = nil
 		b.connected = false
+		b.sessionReady = false
 		b.failPendingLocked(fmt.Errorf("cloud bridge closed"))
 		b.closeFeedSinksLocked()
 		b.mu.Unlock()
@@ -451,7 +461,7 @@ func (b *CloudBridge) handleFeedResponse(command BridgeCommand) bool {
 }
 
 func (b *CloudBridge) handleSignCommand(command BridgeCommand) {
-	if b.identity == nil || command.Identity == nil || command.Identity.UUID != b.identity.UUID {
+	if !identitiesReferenceSameSigningKey(b.identity, command.Identity) {
 		b.sendResponse(command.CID, TypedValue{Kind: "string", Value: "signing denied: identity mismatch"})
 		return
 	}
@@ -463,6 +473,22 @@ func (b *CloudBridge) handleSignCommand(command BridgeCommand) {
 	message, ok := typed.Value.([]byte)
 	if !ok {
 		b.sendResponse(command.CID, TypedValue{Kind: "string", Value: "signing denied: invalid sign payload"})
+		return
+	}
+	challenge, err := validateIdentitySigningChallenge(message, b.identity, time.Now())
+	if err != nil {
+		b.sendResponse(command.CID, TypedValue{Kind: "string", Value: "signing denied: " + err.Error()})
+		return
+	}
+	b.mu.Lock()
+	ready := b.connected && b.sessionReady
+	b.mu.Unlock()
+	if !ready {
+		b.sendResponse(command.CID, TypedValue{Kind: "string", Value: "signing denied: bridge is not ready"})
+		return
+	}
+	if err := b.signingChallenges.consume(challenge, time.Now()); err != nil {
+		b.sendResponse(command.CID, TypedValue{Kind: "string", Value: "signing denied: " + err.Error()})
 		return
 	}
 	signature, err := b.identity.Sign(context.Background(), message)
@@ -497,15 +523,21 @@ func (b *CloudBridge) sendResponse(cid int, payload any) {
 }
 
 func (b *CloudBridge) markReady() {
-	b.readyOnce.Do(func() {
-		close(b.ready)
-	})
+	b.mu.Lock()
+	if !b.connected || b.sessionReady {
+		b.mu.Unlock()
+		return
+	}
+	b.sessionReady = true
+	close(b.ready)
+	b.mu.Unlock()
 }
 
 func (b *CloudBridge) handleReadError(err error) {
 	b.mu.Lock()
 	b.readErr = err
 	b.connected = false
+	b.sessionReady = false
 	b.socket = nil
 	b.failPendingLocked(err)
 	b.closeFeedSinksLocked()

@@ -6,6 +6,7 @@ package cellprotocol
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -96,6 +97,9 @@ func (g *Grant) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(raw.Permission, &permission); err != nil {
 		return err
 	}
+	if !validPermissionBits(permission.Group) || !validPermissionBits(permission.Other) {
+		return fmt.Errorf("permission bits must be between 0 and 15")
+	}
 	g.Permission = permissionString(permission.Group, permission.Other)
 	return nil
 }
@@ -129,22 +133,30 @@ func (g Grant) Grants(requested Grant) bool {
 
 func permissionBits(permission string) (int, int, bool) {
 	trimmed := strings.TrimSpace(permission)
-	if len(trimmed) == 4 && strings.HasSuffix(trimmed, "-") {
-		trimmed = trimmed[:3]
-	}
-	if len(trimmed) == 3 {
+	switch len(trimmed) {
+	case 3:
 		group, ok := permissionTripletBits(trimmed)
 		return group, 0, ok
-	}
-	if len(trimmed) == 6 {
+	case 4:
+		group, ok := permissionQuadBits(trimmed)
+		return group, 0, ok
+	case 6:
 		group, ok := permissionTripletBits(trimmed[:3])
 		if !ok {
 			return 0, 0, false
 		}
 		other, ok := permissionTripletBits(trimmed[3:])
 		return group, other, ok
+	case 8:
+		group, ok := permissionQuadBits(trimmed[:4])
+		if !ok {
+			return 0, 0, false
+		}
+		other, ok := permissionQuadBits(trimmed[4:])
+		return group, other, ok
+	default:
+		return 0, 0, false
 	}
-	return 0, 0, false
 }
 
 func permissionTripletBits(permission string) (int, bool) {
@@ -170,15 +182,35 @@ func permissionTripletBits(permission string) (int, bool) {
 	return bits, true
 }
 
+func permissionQuadBits(permission string) (int, bool) {
+	if len(permission) != 4 {
+		return 0, false
+	}
+	bits, ok := permissionTripletBits(permission[:3])
+	if !ok {
+		return 0, false
+	}
+	if permission[3] == 's' {
+		bits += 8
+	} else if permission[3] != '-' {
+		return 0, false
+	}
+	return bits, true
+}
+
+func validPermissionBits(bits int) bool {
+	return bits >= 0 && bits <= 15
+}
+
 func permissionString(group, other int) string {
-	groupString := permissionTripletString(group)
+	groupString := permissionQuadString(group)
 	if other == 0 {
 		return groupString
 	}
-	return groupString + permissionTripletString(other)
+	return groupString + permissionQuadString(other)
 }
 
-func permissionTripletString(bits int) string {
+func permissionQuadString(bits int) string {
 	var builder strings.Builder
 	if bits&4 == 4 {
 		builder.WriteByte('r')
@@ -192,6 +224,11 @@ func permissionTripletString(bits int) string {
 	}
 	if bits&1 == 1 {
 		builder.WriteByte('x')
+	} else {
+		builder.WriteByte('-')
+	}
+	if bits&8 == 8 {
+		builder.WriteByte('s')
 	} else {
 		builder.WriteByte('-')
 	}

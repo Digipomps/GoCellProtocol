@@ -411,16 +411,15 @@ func (c *GeneralCell) Close(ctx context.Context, requester *Identity) error {
 
 func (c *GeneralCell) AddAgreement(ctx context.Context, contract Agreement, identity *Identity) (AgreementState, error) {
 	_ = ctx
+	_ = contract
 	if identity == nil {
 		return AgreementRejected, fmt.Errorf("identity is nil")
 	}
-	if contract.State == "" || contract.State == AgreementStateTemplate {
-		contract.State = AgreementSigned
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.agreements[identity.UUID] = contract
-	return contract.State, nil
+	// GoCellProtocol does not yet have the Swift runtime's signed Contract and
+	// owner-proof admission path. Installing a caller-supplied Agreement here
+	// would let its subject mint arbitrary grants, so admission remains closed
+	// until that proof-bearing model is ported and fixture-tested.
+	return AgreementRejected, nil
 }
 
 func (c *GeneralCell) Advertise(ctx context.Context, requester *Identity) (AnyCell, error) {

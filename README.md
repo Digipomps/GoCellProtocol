@@ -58,6 +58,17 @@ been updated, update that baseline file in the same commit.
 The Skeleton model is parsed and round-tripped as portable JSON. Go does not ship
 a UI renderer in this repository.
 
+### Current security boundary
+
+- Local `GeneralCell.AddAgreement` admission is fail-closed. The Go port does
+  not yet implement Swift's owner-proof, template-derived, signed `Contract`
+  admission model, so caller-supplied Agreements cannot install grants.
+- Bridge signing accepts only the canonical, short-lived
+  `IdentitySigningChallenge` wire shape for the bound identity and rejects
+  replay. Arbitrary remote byte signing is not supported.
+- Permission objects decode and encode Swift's current `rwxs` storage bit while
+  continuing to accept legacy three/six-character permission text.
+
 ## Reference Sources Used
 
 Local reference material used while building this port:

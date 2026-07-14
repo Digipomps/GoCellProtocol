@@ -111,7 +111,7 @@ func TestTrustedIssuersProxyFailsClosedWithoutVerifier(t *testing.T) {
 	}
 }
 
-func TestResolverRejectsMissingCapabilityAndAllowsSignedGrant(t *testing.T) {
+func TestGeneralCellRejectsCallerSuppliedAgreementWithoutOwnerProof(t *testing.T) {
 	ctx := context.Background()
 	vault := NewInMemoryIdentityVault()
 	owner, _ := vault.Identity(ctx, "owner", true)
@@ -123,18 +123,11 @@ func TestResolverRejectsMissingCapabilityAndAllowsSignedGrant(t *testing.T) {
 	}
 	agreement := NewAgreement(owner)
 	agreement.Grants = []Grant{NewGrant("", "state", "rw--")}
-	if state, err := cell.AddAgreement(ctx, agreement, guest); err != nil || state != AgreementSigned {
-		t.Fatalf("add agreement state=%s err=%v", state, err)
+	if state, err := cell.AddAgreement(ctx, agreement, guest); err != nil || state != AgreementRejected {
+		t.Fatalf("caller-supplied agreement state=%s err=%v", state, err)
 	}
-	if _, err := cell.Set(ctx, "state.value", "allowed", guest); err != nil {
-		t.Fatalf("set with grant failed: %v", err)
-	}
-	got, err := cell.Get(ctx, "state.value", guest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "allowed" {
-		t.Fatalf("got = %#v", got)
+	if _, err := cell.Set(ctx, "state.value", "still denied", guest); err == nil {
+		t.Fatalf("rejected caller agreement must not install its grant")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 var bridgeCommands = map[string]struct{}{
@@ -122,12 +123,17 @@ func (c BridgeCommand) Dumps() (string, error) {
 }
 
 type BridgeEndpoint struct {
-	Target CellProtocol
-	Owner  *Identity
+	Target            CellProtocol
+	Owner             *Identity
+	signingChallenges *signingChallengeReplayStore
 }
 
 func NewBridgeEndpoint(target CellProtocol, owner *Identity) *BridgeEndpoint {
-	return &BridgeEndpoint{Target: target, Owner: owner}
+	return &BridgeEndpoint{
+		Target:            target,
+		Owner:             owner,
+		signingChallenges: newSigningChallengeReplayStore(),
+	}
 }
 
 func (e *BridgeEndpoint) Handle(ctx context.Context, command BridgeCommand) []BridgeCommand {
@@ -163,7 +169,18 @@ func (e *BridgeEndpoint) Handle(ctx context.Context, command BridgeCommand) []Br
 		}
 		return response(TypedValue{Kind: "connectState", Value: string(state)})
 	case "agreement":
-		return response(TypedValue{Kind: "agreementState", Value: string(AgreementSigned)})
+		if command.Identity == nil {
+			return response(TypedValue{Kind: "agreementState", Value: string(AgreementRejected)})
+		}
+		agreement, err := payloadAgreement(command.Payload)
+		if err != nil {
+			return fail(err)
+		}
+		state, err := e.Target.AddAgreement(ctx, agreement, command.Identity)
+		if err != nil {
+			return fail(err)
+		}
+		return response(TypedValue{Kind: "agreementState", Value: string(state)})
 	case "get":
 		keypath, err := payloadString(command.Payload)
 		if err != nil {
@@ -217,14 +234,24 @@ func (e *BridgeEndpoint) Handle(ctx context.Context, command BridgeCommand) []Br
 		}
 		return response(TypedValue{Kind: "list", Value: statuses})
 	case "sign":
-		if requester == nil {
-			return fail(fmt.Errorf("sign requires identity"))
+		if !identitiesReferenceSameSigningKey(e.Owner, command.Identity) {
+			return fail(fmt.Errorf("signing denied: identity does not match the bound signing authority"))
+		}
+		if typed, ok := command.Payload.(TypedValue); !ok || typed.Kind != "signData" {
+			return fail(fmt.Errorf("signing denied: expected canonical sign payload"))
 		}
 		message, err := payloadBytes(command.Payload)
 		if err != nil {
 			return fail(err)
 		}
-		signature, err := requester.Sign(ctx, message)
+		challenge, err := validateIdentitySigningChallenge(message, e.Owner, time.Now())
+		if err != nil {
+			return fail(fmt.Errorf("signing denied: %w", err))
+		}
+		if err := e.signingChallenges.consume(challenge, time.Now()); err != nil {
+			return fail(fmt.Errorf("signing denied: %w", err))
+		}
+		signature, err := e.Owner.Sign(ctx, message)
 		if err != nil {
 			return fail(err)
 		}
@@ -310,7 +337,7 @@ func (b *BridgeBase) AddAgreement(ctx context.Context, contract Agreement, ident
 	if state, ok := value.(string); ok {
 		return AgreementState(state), nil
 	}
-	return AgreementSigned, nil
+	return AgreementRejected, nil
 }
 
 func (b *BridgeBase) Advertise(ctx context.Context, requester *Identity) (AnyCell, error) {
@@ -412,6 +439,27 @@ func payloadKeyValue(payload any) (KeyValue, error) {
 		return KeyValue{}, err
 	}
 	return kv, nil
+}
+
+func payloadAgreement(payload any) (Agreement, error) {
+	if typed, ok := payload.(TypedValue); ok {
+		if typed.Kind != "agreementPayload" {
+			return Agreement{}, fmt.Errorf("expected agreement payload")
+		}
+		payload = typed.Value
+	}
+	if agreement, ok := payload.(Agreement); ok {
+		return agreement, nil
+	}
+	data, err := StableJSON(payload)
+	if err != nil {
+		return Agreement{}, err
+	}
+	var agreement Agreement
+	if err := DecodeJSON(data, &agreement); err != nil {
+		return Agreement{}, err
+	}
+	return agreement, nil
 }
 
 func payloadBytes(payload any) ([]byte, error) {

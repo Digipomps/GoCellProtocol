@@ -55,7 +55,7 @@ func TestGrantHandlesSwiftPermissionObject(t *testing.T) {
 	if err := DecodeJSON([]byte(`{"name":"Feed grant","keypath":"feed","permission":{"group":4,"other":0}}`), &grant); err != nil {
 		t.Fatal(err)
 	}
-	if grant.Permission != "r--" {
+	if grant.Permission != "r---" {
 		t.Fatalf("permission = %q", grant.Permission)
 	}
 
@@ -73,6 +73,46 @@ func TestGrantHandlesSwiftPermissionObject(t *testing.T) {
 	}
 	if permission["group"] != json.Number("6") || permission["other"] != json.Number("0") {
 		t.Fatalf("unexpected permission bits: %#v", permission)
+	}
+}
+
+func TestGrantHandlesSwiftStoragePermissionAndLegacyText(t *testing.T) {
+	var storage Grant
+	if err := DecodeJSON([]byte(`{"name":"Store","keypath":"shared","permission":{"uuid":"permission-1","group":12,"other":8}}`), &storage); err != nil {
+		t.Fatal(err)
+	}
+	if storage.Permission != "r--s---s" {
+		t.Fatalf("storage permission = %q", storage.Permission)
+	}
+	data, err := json.Marshal(storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded map[string]any
+	if err := DecodeJSON(data, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	permission := encoded["permission"].(map[string]any)
+	if permission["group"] != json.Number("12") || permission["other"] != json.Number("8") {
+		t.Fatalf("storage permission bits = %#v", permission)
+	}
+
+	for _, legacy := range []string{"r--", "rw-r--"} {
+		var grant Grant
+		payload := []byte(`{"name":"Legacy","keypath":"shared","permission":"` + legacy + `"}`)
+		if err := DecodeJSON(payload, &grant); err != nil {
+			t.Fatalf("decode legacy %q: %v", legacy, err)
+		}
+		if grant.Permission != legacy {
+			t.Fatalf("legacy permission %q became %q", legacy, grant.Permission)
+		}
+	}
+}
+
+func TestGrantRejectsUnknownSwiftPermissionBits(t *testing.T) {
+	var grant Grant
+	if err := DecodeJSON([]byte(`{"name":"Unknown","keypath":"shared","permission":{"group":16,"other":0}}`), &grant); err == nil {
+		t.Fatalf("expected unknown permission bits to fail closed")
 	}
 }
 
