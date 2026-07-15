@@ -138,9 +138,6 @@ func NewBridgeEndpoint(target CellProtocol, owner *Identity) *BridgeEndpoint {
 
 func (e *BridgeEndpoint) Handle(ctx context.Context, command BridgeCommand) []BridgeCommand {
 	requester := command.Identity
-	if requester == nil {
-		requester = e.Owner
-	}
 	cid := command.CID
 	response := func(value any) []BridgeCommand {
 		return []BridgeCommand{{Cmd: "response", CID: cid, Payload: value}}
@@ -289,13 +286,35 @@ func (b *BridgeBase) request(ctx context.Context, cmd string, payload any) (any,
 	return response.Payload, nil
 }
 
+func (b *BridgeBase) validateRequester(ctx context.Context, requester *Identity, action, resource string) error {
+	if b.identity == nil || requester == nil {
+		return fmt.Errorf("access denied: bridge request requires a bound proof-bearing identity")
+	}
+	if !identityProvesSigningKeyControl(
+		ctx,
+		b.identity,
+		requester,
+		requester.Domain,
+		resource,
+		action,
+		"GoCellProtocol.BridgeBase",
+	) {
+		return fmt.Errorf("access denied: requester did not prove control of the bridge identity")
+	}
+	return nil
+}
+
 func (b *BridgeBase) Get(ctx context.Context, keypath string, requester *Identity) (any, error) {
-	_ = requester
+	if err := b.validateRequester(ctx, requester, "get", keypath); err != nil {
+		return nil, err
+	}
 	return b.request(ctx, "get", TypedValue{Kind: "string", Value: keypath})
 }
 
 func (b *BridgeBase) Set(ctx context.Context, keypath string, value any, requester *Identity) (any, error) {
-	_ = requester
+	if err := b.validateRequester(ctx, requester, "set", keypath); err != nil {
+		return nil, err
+	}
 	response, err := b.request(ctx, "set", TypedValue{Kind: "keyValue", Value: KeyValue{Key: keypath, Value: value}})
 	if err != nil {
 		return nil, err
@@ -326,10 +345,17 @@ func (b *BridgeBase) Admit(ctx context.Context, connect ConnectContext) (Connect
 	return ConnectDenied, nil
 }
 
-func (b *BridgeBase) Close(context.Context, *Identity) error { return nil }
+func (b *BridgeBase) Close(ctx context.Context, requester *Identity) error {
+	if err := b.validateRequester(ctx, requester, "close", "lifecycle.close"); err != nil {
+		return err
+	}
+	return fmt.Errorf("remote close transport not configured")
+}
 
 func (b *BridgeBase) AddAgreement(ctx context.Context, contract Agreement, identity *Identity) (AgreementState, error) {
-	_ = identity
+	if err := b.validateRequester(ctx, identity, "agreement", "agreements"); err != nil {
+		return AgreementRejected, err
+	}
 	value, err := b.request(ctx, "agreement", TypedValue{Kind: "agreementPayload", Value: contract})
 	if err != nil {
 		return AgreementRejected, err
@@ -352,7 +378,9 @@ func (b *BridgeBase) Advertise(ctx context.Context, requester *Identity) (AnyCel
 }
 
 func (b *BridgeBase) State(ctx context.Context, requester *Identity) (any, error) {
-	_ = requester
+	if err := b.validateRequester(ctx, requester, "state", "state"); err != nil {
+		return nil, err
+	}
 	return b.request(ctx, "state", nil)
 }
 
@@ -360,21 +388,36 @@ func (b *BridgeBase) CellUUID() string { return "" }
 
 func (b *BridgeBase) IdentityDomain() string { return "" }
 
-func (b *BridgeBase) GetOwner(context.Context, *Identity) (*Identity, error) { return b.identity, nil }
+func (b *BridgeBase) GetOwner(ctx context.Context, requester *Identity) (*Identity, error) {
+	if err := b.validateRequester(ctx, requester, "getOwner", "owner"); err != nil {
+		return nil, err
+	}
+	return b.identity, nil
+}
 
 func (b *BridgeBase) GetEmitterWithUUID(context.Context, string, *Identity) (Emit, error) {
-	return nil, nil
+	return nil, fmt.Errorf("remote emitter lookup transport not configured")
 }
 
 func (b *BridgeBase) Attach(context.Context, Emit, string, *Identity) (ConnectState, error) {
 	return ConnectDenied, fmt.Errorf("remote attach transport not configured")
 }
 
-func (b *BridgeBase) AbsorbFlow(context.Context, string, *Identity) error { return nil }
-func (b *BridgeBase) Detach(context.Context, string, *Identity) error     { return nil }
-func (b *BridgeBase) DropFlow(context.Context, string, *Identity) error   { return nil }
-func (b *BridgeBase) DropAllFlows(context.Context, *Identity) error       { return nil }
-func (b *BridgeBase) DetachAll(context.Context, *Identity) error          { return nil }
+func (b *BridgeBase) AbsorbFlow(context.Context, string, *Identity) error {
+	return fmt.Errorf("remote flow subscription transport not configured")
+}
+func (b *BridgeBase) Detach(context.Context, string, *Identity) error {
+	return fmt.Errorf("remote detach transport not configured")
+}
+func (b *BridgeBase) DropFlow(context.Context, string, *Identity) error {
+	return fmt.Errorf("remote drop-flow transport not configured")
+}
+func (b *BridgeBase) DropAllFlows(context.Context, *Identity) error {
+	return fmt.Errorf("remote drop-all-flows transport not configured")
+}
+func (b *BridgeBase) DetachAll(context.Context, *Identity) error {
+	return fmt.Errorf("remote detach-all transport not configured")
+}
 
 func (b *BridgeBase) AttachedStatus(context.Context, string, *Identity) (ConnectionStatus, error) {
 	return ConnectionStatus{State: ConnectNotConnected}, nil
@@ -385,7 +428,9 @@ func (b *BridgeBase) AttachedStatuses(context.Context, *Identity) ([]ConnectionS
 }
 
 func (b *BridgeBase) Keys(ctx context.Context, requester *Identity) ([]string, error) {
-	_ = requester
+	if err := b.validateRequester(ctx, requester, "keys", "keys"); err != nil {
+		return nil, err
+	}
 	value, err := b.request(ctx, "keys", nil)
 	if err != nil {
 		return nil, err
@@ -404,7 +449,9 @@ func (b *BridgeBase) Keys(ctx context.Context, requester *Identity) ([]string, e
 }
 
 func (b *BridgeBase) TypeForKey(ctx context.Context, keypath string, requester *Identity) (string, error) {
-	_ = requester
+	if err := b.validateRequester(ctx, requester, "typeForKey", keypath); err != nil {
+		return "", err
+	}
 	value, err := b.request(ctx, "typeForKey", TypedValue{Kind: "string", Value: keypath})
 	if err != nil {
 		return "", err

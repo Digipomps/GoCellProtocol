@@ -211,6 +211,9 @@ func (b *CloudBridge) SendCommand(ctx context.Context, command BridgeCommand) (B
 }
 
 func (b *CloudBridge) Flow(ctx context.Context, requester *Identity) (<-chan FlowElement, error) {
+	if err := b.base.validateRequester(ctx, requester, "feed", "feed"); err != nil {
+		return nil, err
+	}
 	if err := b.Connect(ctx); err != nil {
 		return nil, err
 	}
@@ -292,7 +295,9 @@ func (b *CloudBridge) Admit(ctx context.Context, connect ConnectContext) (Connec
 }
 
 func (b *CloudBridge) Close(ctx context.Context, requester *Identity) error {
-	_ = requester
+	if err := b.base.validateRequester(ctx, requester, "close", "lifecycle.close"); err != nil {
+		return err
+	}
 	return b.CloseConnection()
 }
 

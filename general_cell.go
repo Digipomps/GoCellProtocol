@@ -257,8 +257,7 @@ func (c *GeneralCell) TypeForKey(ctx context.Context, keypath string, requester 
 }
 
 func (c *GeneralCell) Attach(ctx context.Context, emitter Emit, label string, requester *Identity) (ConnectState, error) {
-	_ = ctx
-	if err := c.ValidateAccess(context.Background(), "write", label, requester); err != nil && c.owner != nil {
+	if err := c.ValidateAccess(ctx, "write", label, requester); err != nil {
 		return ConnectDenied, err
 	}
 	c.mu.Lock()
@@ -268,6 +267,9 @@ func (c *GeneralCell) Attach(ctx context.Context, emitter Emit, label string, re
 }
 
 func (c *GeneralCell) AbsorbFlow(ctx context.Context, label string, requester *Identity) error {
+	if err := c.ValidateAccess(ctx, "write", label, requester); err != nil {
+		return err
+	}
 	c.mu.RLock()
 	emitter := c.attached[label]
 	c.mu.RUnlock()
@@ -295,8 +297,9 @@ func (c *GeneralCell) AbsorbFlow(ctx context.Context, label string, requester *I
 }
 
 func (c *GeneralCell) Detach(ctx context.Context, label string, requester *Identity) error {
-	_ = ctx
-	_ = requester
+	if err := c.ValidateAccess(ctx, "write", label, requester); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.attached, label)
@@ -312,8 +315,9 @@ func (c *GeneralCell) DropAllFlows(ctx context.Context, requester *Identity) err
 }
 
 func (c *GeneralCell) DetachAll(ctx context.Context, requester *Identity) error {
-	_ = ctx
-	_ = requester
+	if err := c.ValidateAccess(ctx, "write", "connections", requester); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attached = map[string]Emit{}
@@ -321,8 +325,9 @@ func (c *GeneralCell) DetachAll(ctx context.Context, requester *Identity) error 
 }
 
 func (c *GeneralCell) AttachedStatus(ctx context.Context, label string, requester *Identity) (ConnectionStatus, error) {
-	_ = ctx
-	_ = requester
+	if err := c.ValidateAccess(ctx, "read", label, requester); err != nil {
+		return ConnectionStatus{}, err
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if _, ok := c.attached[label]; ok {
@@ -332,8 +337,9 @@ func (c *GeneralCell) AttachedStatus(ctx context.Context, label string, requeste
 }
 
 func (c *GeneralCell) AttachedStatuses(ctx context.Context, requester *Identity) ([]ConnectionStatus, error) {
-	_ = ctx
-	_ = requester
+	if err := c.ValidateAccess(ctx, "read", "connections", requester); err != nil {
+		return nil, err
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]ConnectionStatus, 0, len(c.attached))
@@ -345,7 +351,7 @@ func (c *GeneralCell) AttachedStatuses(ctx context.Context, requester *Identity)
 }
 
 func (c *GeneralCell) Flow(ctx context.Context, requester *Identity) (<-chan FlowElement, error) {
-	if err := c.ValidateAccess(ctx, "flow.read", "feed", requester); err != nil && c.owner != nil {
+	if err := c.ValidateAccess(ctx, "flow.read", "feed", requester); err != nil {
 		return nil, err
 	}
 	ch := make(chan FlowElement, 64)
@@ -380,7 +386,7 @@ func (c *GeneralCell) Admit(ctx context.Context, connect ConnectContext) (Connec
 		return ConnectDenied, nil
 	}
 	c.mu.RLock()
-	agreement, ok := c.agreements[requester.UUID]
+	agreement, ok := c.agreements[identityReferenceKey(requester)]
 	c.mu.RUnlock()
 	if !ok {
 		return ConnectSignContract, nil
@@ -397,8 +403,9 @@ func (c *GeneralCell) Admit(ctx context.Context, connect ConnectContext) (Connec
 }
 
 func (c *GeneralCell) Close(ctx context.Context, requester *Identity) error {
-	_ = ctx
-	_ = requester
+	if err := c.ValidateAccess(ctx, "write", "lifecycle.close", requester); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closed = true
@@ -451,22 +458,28 @@ func (c *GeneralCell) State(ctx context.Context, requester *Identity) (any, erro
 	if state, err := c.Get(ctx, "state", requester); err == nil {
 		return state, nil
 	}
+	if err := c.ValidateAccess(ctx, "read", "state", requester); err != nil {
+		return nil, err
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return NormalizeJSON(c.storage), nil
 }
 
 func (c *GeneralCell) GetOwner(ctx context.Context, requester *Identity) (*Identity, error) {
-	_ = ctx
+	if err := c.ValidateAccess(ctx, "read", "owner", requester); err != nil {
+		return nil, err
+	}
 	if c.owner == nil {
-		return requester, nil
+		return nil, fmt.Errorf("cell has no owner")
 	}
 	return c.owner, nil
 }
 
 func (c *GeneralCell) GetEmitterWithUUID(ctx context.Context, uuid string, requester *Identity) (Emit, error) {
-	_ = ctx
-	_ = requester
+	if err := c.ValidateAccess(ctx, "read", "emitters", requester); err != nil {
+		return nil, err
+	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.uuid == uuid {
@@ -481,12 +494,13 @@ func (c *GeneralCell) GetEmitterWithUUID(ctx context.Context, uuid string, reque
 }
 
 func (c *GeneralCell) IsMember(ctx context.Context, identity *Identity, requester *Identity) (bool, error) {
-	_ = ctx
-	_ = requester
-	if c.owner == nil || identity == nil {
-		return c.owner == nil, nil
+	if err := c.ValidateAccess(ctx, "read", "membership", requester); err != nil {
+		return false, err
 	}
-	return identity.UUID == c.owner.UUID, nil
+	if c.owner == nil || identity == nil {
+		return false, nil
+	}
+	return identitiesReferenceSameSigningKey(c.owner, identity), nil
 }
 
 func (c *GeneralCell) PushFlowElement(element FlowElement, topic string) {
@@ -537,20 +551,35 @@ func (c *GeneralCell) FlowHistory() []FlowElement {
 }
 
 func (c *GeneralCell) ValidateAccess(ctx context.Context, operation, keypath string, requester *Identity) error {
-	_ = ctx
 	c.mu.RLock()
 	owner := c.owner
 	agreement := Agreement{}
 	hasAgreement := false
 	if requester != nil {
-		agreement, hasAgreement = c.agreements[requester.UUID]
+		agreement, hasAgreement = c.agreements[identityReferenceKey(requester)]
 	}
+	cellUUID := c.uuid
+	identityDomain := c.identityDomain
 	c.mu.RUnlock()
 	if owner == nil {
-		return nil
+		return fmt.Errorf("access denied: cell has no owner or explicit public policy")
 	}
 	if requester != nil && requester.UUID == owner.UUID {
-		return nil
+		if !identitiesReferenceSameSigningKey(owner, requester) {
+			return fmt.Errorf("access denied: owner UUID matched but signing key differed")
+		}
+		if identityProvesSigningKeyControl(
+			ctx,
+			owner,
+			requester,
+			identityDomain,
+			"cell:///"+cellUUID+"/"+keypath,
+			operation,
+			"GoCellProtocol.GeneralCell",
+		) {
+			return nil
+		}
+		return fmt.Errorf("access denied: owner signing-key proof failed")
 	}
 	if !hasAgreement {
 		return fmt.Errorf("access denied: no contract for %s", identityLabel(requester))

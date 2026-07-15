@@ -92,12 +92,11 @@ func (r *CellResolve) Resolve(ctx context.Context, requester *Identity) (CellPro
 	case ScopeTemplate:
 		return r.newInstance(ctx, requester)
 	case ScopeIdentityUnique:
-		key := "anonymous"
-		if requester != nil {
-			key = requester.UUID
-		} else if r.Identity != nil {
-			key = r.Identity.UUID
+		identity := requester
+		if identity == nil {
+			identity = r.Identity
 		}
+		key := identityRuntimePrincipalKey(ctx, identity)
 		if r.identityInstances == nil {
 			r.identityInstances = map[string]CellProtocol{}
 		}
@@ -396,10 +395,7 @@ func (r *CellResolver) loadReference(ctx context.Context, ref CellReference, int
 }
 
 func (r *CellResolver) remoteBridge(bridgeURL string, requester *Identity) CellProtocol {
-	key := bridgeURL + "|anonymous"
-	if requester != nil {
-		key = bridgeURL + "|" + requester.UUID
-	}
+	key := bridgeURL + "|" + identityRuntimePrincipalKey(context.Background(), requester)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.remoteCache[key] == nil {

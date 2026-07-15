@@ -63,11 +63,28 @@ a UI renderer in this repository.
 - Local `GeneralCell.AddAgreement` admission is fail-closed. The Go port does
   not yet implement Swift's owner-proof, template-derived, signed `Contract`
   admission model, so caller-supplied Agreements cannot install grants.
+- Protected local `GeneralCell` access requires a fresh signing-key
+  proof-of-possession for the stored owner reference. UUID or public-key
+  equality alone is not authority, and an ownerless Cell is not implicitly
+  public-readable or public-writable.
+- Inbound `BridgeEndpoint` access never substitutes a missing requester with the
+  owner. A decoded wire identity has no local vault proof and is therefore
+  denied protected `get`, `set`, state, flow, and lifecycle access. A portable
+  signed request envelope for Swift/Go remote owner or Contract access is not
+  implemented yet; those inbound paths intentionally remain fail-closed.
+- Identity-scoped Cell instances and cached remote bridges are separated by the
+  proof-bearing runtime principal. A UUID collision cannot borrow an existing
+  owner-bound instance or bridge.
 - Bridge signing accepts only the canonical, short-lived
   `IdentitySigningChallenge` wire shape for the bound identity and rejects
   replay. Arbitrary remote byte signing is not supported.
 - Permission objects decode and encode Swift's current `rwxs` storage bit while
   continuing to accept legacy three/six-character permission text.
+
+`CloudBridge` can exercise the current Swift-shaped wire contract, but live
+Swift protected-access proof parity, stale-proof rejection, process restart,
+and owner-published public read remain **NOT PROVEN** by the local suite or the
+opt-in advertise-only staging smoke.
 
 ## Reference Sources Used
 

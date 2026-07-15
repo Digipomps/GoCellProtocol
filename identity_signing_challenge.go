@@ -4,7 +4,9 @@
 package cellprotocol
 
 import (
+	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -123,6 +125,96 @@ func identitiesReferenceSameSigningKey(expected, presented *Identity) bool {
 	expectedFingerprint, expectedErr := signingPublicKeyFingerprint(expected)
 	presentedFingerprint, presentedErr := signingPublicKeyFingerprint(presented)
 	return expectedErr == nil && presentedErr == nil && expectedFingerprint == presentedFingerprint
+}
+
+// identityProvesSigningKeyControl performs a fresh local proof-of-possession
+// challenge. Identity descriptors and UUIDs are references only; neither is
+// authority without a vault that can sign for the presented public key.
+func identityProvesSigningKeyControl(
+	ctx context.Context,
+	expected *Identity,
+	presented *Identity,
+	domain string,
+	resource string,
+	action string,
+	audience string,
+) bool {
+	if !identitiesReferenceSameSigningKey(expected, presented) || presented.Vault() == nil {
+		return false
+	}
+	if strings.TrimSpace(domain) == "" {
+		domain = "local"
+	}
+	fingerprint, err := signingPublicKeyFingerprint(expected)
+	if err != nil {
+		return false
+	}
+	nonce := make([]byte, identitySigningChallengeMinimumNonce)
+	if _, err := rand.Read(nonce); err != nil {
+		return false
+	}
+	now := time.Now()
+	nowSeconds := float64(now.UnixNano()) / float64(time.Second)
+	challenge := identitySigningChallenge{
+		Type:                 identitySigningChallengeType,
+		Version:              identitySigningChallengeVersion,
+		Purpose:              identitySigningChallengePurpose,
+		IdentityUUID:         presented.UUID,
+		PublicKeyFingerprint: fingerprint,
+		Domain:               domain,
+		Resource:             resource,
+		Action:               action,
+		Audience:             audience,
+		Nonce:                nonce,
+		IssuedAt:             nowSeconds,
+		ExpiresAt:            nowSeconds + identitySigningChallengeValiditySeconds,
+	}
+	message, err := json.Marshal(challenge)
+	if err != nil {
+		return false
+	}
+	if _, err := validateIdentitySigningChallenge(message, expected, now); err != nil {
+		return false
+	}
+	signature, err := presented.Sign(ctx, message)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return false
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(expected.PublicSecureKey)
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		return false
+	}
+	return ed25519.Verify(ed25519.PublicKey(publicKey), message, signature)
+}
+
+func identityReferenceKey(identity *Identity) string {
+	if identity == nil {
+		return "anonymous"
+	}
+	fingerprint, err := signingPublicKeyFingerprint(identity)
+	if err != nil {
+		return identity.UUID + "|unverified"
+	}
+	return identity.UUID + "|" + fingerprint
+}
+
+func identityRuntimePrincipalKey(ctx context.Context, identity *Identity) string {
+	base := identityReferenceKey(identity)
+	if identity == nil {
+		return base
+	}
+	if identityProvesSigningKeyControl(
+		ctx,
+		identity,
+		identity,
+		identity.Domain,
+		"cellprotocol.runtime-principal",
+		"resolve",
+		"GoCellProtocol",
+	) {
+		return base
+	}
+	return fmt.Sprintf("%s|unproved:%p", base, identity)
 }
 
 type signingChallengeReplayStore struct {

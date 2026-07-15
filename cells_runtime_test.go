@@ -45,15 +45,16 @@ func TestVaultCellContractsCreateListLinkAndState(t *testing.T) {
 
 func TestGraphIndexExtractsWikiLinks(t *testing.T) {
 	ctx := context.Background()
-	graph := NewGraphIndexCell(nil)
-	result, err := graph.Set(ctx, "graph.reindex", map[string]any{"notes": []any{map[string]any{"id": "n1", "content": "See [[n2]] and [[n3]]"}}}, nil)
+	owner, _ := NewInMemoryIdentityVault().Identity(ctx, "graph-owner", true)
+	graph := NewGraphIndexCell(owner)
+	result, err := graph.Set(ctx, "graph.reindex", map[string]any{"notes": []any{map[string]any{"id": "n1", "content": "See [[n2]] and [[n3]]"}}}, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.(map[string]any)["edgeCount"] != 2 {
 		t.Fatalf("result = %#v", result)
 	}
-	outgoing, _ := graph.Set(ctx, "graph.outgoing", map[string]any{"id": "n1"}, nil)
+	outgoing, _ := graph.Set(ctx, "graph.outgoing", map[string]any{"id": "n1"}, owner)
 	ids := outgoing.(map[string]any)["ids"].([]string)
 	if len(ids) != 2 || ids[0] != "n2" || ids[1] != "n3" {
 		t.Fatalf("outgoing = %#v", outgoing)
@@ -100,8 +101,9 @@ func TestEntityAnchorIdentityLinksAndBatchPersist(t *testing.T) {
 
 func TestTrustedIssuersProxyFailsClosedWithoutVerifier(t *testing.T) {
 	ctx := context.Background()
-	cell := NewTrustedIssuersProxyCell(nil, nil)
-	result, err := cell.Set(ctx, "trustedIssuers.evaluate", map[string]any{"issuerId": "did:key:test", "candidateVc": map[string]any{}}, nil)
+	owner, _ := NewInMemoryIdentityVault().Identity(ctx, "trusted-issuer-owner", true)
+	cell := NewTrustedIssuersProxyCell(owner, nil)
+	result, err := cell.Set(ctx, "trustedIssuers.evaluate", map[string]any{"issuerId": "did:key:test", "candidateVc": map[string]any{}}, owner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,9 +135,10 @@ func TestGeneralCellRejectsCallerSuppliedAgreementWithoutOwnerProof(t *testing.T
 
 func TestReplayDeterminism(t *testing.T) {
 	ctx := context.Background()
-	cell := NewGeneralCell(nil, "Replay")
-	_, _ = cell.Set(ctx, "state.a", "one", nil)
-	_, _ = cell.Set(ctx, "state.b", "two", nil)
+	owner, _ := NewInMemoryIdentityVault().Identity(ctx, "replay-owner", true)
+	cell := NewGeneralCell(owner, "Replay")
+	_, _ = cell.Set(ctx, "state.a", "one", owner)
+	_, _ = cell.Set(ctx, "state.b", "two", owner)
 	history := cell.FlowHistory()
 	replayed, err := ReplayFlow(history)
 	if err != nil {

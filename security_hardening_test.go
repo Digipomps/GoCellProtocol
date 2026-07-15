@@ -52,6 +52,166 @@ func TestBridgeAgreementAdmissionDelegatesAndFailsClosed(t *testing.T) {
 	}
 }
 
+func TestBridgeEndpointRejectsMissingAndUnprovedOwnerIdentity(t *testing.T) {
+	ctx := context.Background()
+	vault := NewInMemoryIdentityVault()
+	owner, _ := vault.Identity(ctx, "owner", true)
+	cell := NewGeneralCell(owner, "Protected")
+	endpoint := NewBridgeEndpoint(cell, owner)
+
+	missingIdentity := endpoint.Handle(ctx, BridgeCommand{
+		Cmd:     "set",
+		CID:     1,
+		Payload: TypedValue{Kind: "keyValue", Value: KeyValue{Key: "private.secret", Value: "forged"}},
+	})[0].Payload.(TypedValue)
+	if missingIdentity.Kind != "setValueResponse" || missingIdentity.Value.(SetValueResponse).State != "error" {
+		t.Fatalf("missing-identity bridge set response = %#v", missingIdentity)
+	}
+
+	wireOwner := cloneWireIdentity(t, owner)
+	unprovedOwner := endpoint.Handle(ctx, BridgeCommand{
+		Cmd:      "set",
+		CID:      2,
+		Identity: wireOwner,
+		Payload:  TypedValue{Kind: "keyValue", Value: KeyValue{Key: "private.secret", Value: "forged"}},
+	})[0].Payload.(TypedValue)
+	if unprovedOwner.Kind != "setValueResponse" || unprovedOwner.Value.(SetValueResponse).State != "error" {
+		t.Fatalf("unproved wire-owner bridge set response = %#v", unprovedOwner)
+	}
+
+	if _, err := cell.Get(ctx, "private.secret", owner); err == nil {
+		t.Fatalf("denied bridge requests mutated protected state")
+	}
+}
+
+func TestGeneralCellRequiresOwnerKeyControlAndProtectsStateLifecycle(t *testing.T) {
+	ctx := context.Background()
+	vault := NewInMemoryIdentityVault()
+	owner, _ := vault.Identity(ctx, "owner", true)
+	guest, _ := vault.Identity(ctx, "guest", true)
+	cell := NewGeneralCell(owner, "Protected")
+
+	if _, err := cell.Set(ctx, "private.secret", "owner value", owner); err != nil {
+		t.Fatalf("proved owner set failed: %v", err)
+	}
+	if _, err := cell.Set(ctx, "private.secret", "wire clone", cloneWireIdentity(t, owner)); err == nil {
+		t.Fatalf("wire clone with copied public identity was accepted without key proof")
+	}
+
+	sameUUIDWrongKey := cloneWireIdentity(t, guest)
+	sameUUIDWrongKey.UUID = owner.UUID
+	if _, err := cell.Set(ctx, "private.secret", "wrong key", sameUUIDWrongKey); err == nil {
+		t.Fatalf("same UUID with a different signing key was accepted as owner")
+	}
+	if _, err := cell.State(ctx, guest); err == nil {
+		t.Fatalf("outsider received raw state after protected state lookup failed")
+	}
+
+	emitter := NewGeneralCell(owner, "Emitter")
+	if _, err := cell.Attach(ctx, emitter, "source", owner); err != nil {
+		t.Fatalf("owner attach failed: %v", err)
+	}
+	if err := cell.Detach(ctx, "source", guest); err == nil {
+		t.Fatalf("outsider detached owner flow")
+	}
+	status, err := cell.AttachedStatus(ctx, "source", owner)
+	if err != nil || status.State != ConnectConnected {
+		t.Fatalf("owner flow was removed by denied detach: status=%#v err=%v", status, err)
+	}
+	if err := cell.Close(ctx, guest); err == nil {
+		t.Fatalf("outsider closed owner cell")
+	}
+	cell.mu.RLock()
+	closed := cell.closed
+	cell.mu.RUnlock()
+	if closed {
+		t.Fatalf("denied close changed cell lifecycle state")
+	}
+}
+
+func TestUnownedGeneralCellFailsClosedForProtectedAccess(t *testing.T) {
+	ctx := context.Background()
+	cell := NewGeneralCell(nil, "Unowned")
+	if _, err := cell.Set(ctx, "state.value", "public write", nil); err == nil {
+		t.Fatalf("ownerless cell implicitly allowed an anonymous protected write")
+	}
+	if _, err := cell.Get(ctx, "state.value", nil); err == nil {
+		t.Fatalf("ownerless cell implicitly allowed an anonymous protected read")
+	}
+	if _, err := cell.Flow(ctx, nil); err == nil {
+		t.Fatalf("ownerless cell implicitly allowed anonymous flow access")
+	}
+}
+
+func TestBridgeBaseRejectsRequesterSubstitutionBeforeSending(t *testing.T) {
+	ctx := context.Background()
+	vault := NewInMemoryIdentityVault()
+	owner, _ := vault.Identity(ctx, "owner", true)
+	guest, _ := vault.Identity(ctx, "guest", true)
+	sendCount := 0
+	bridge := NewBridgeBase(func(ctx context.Context, command BridgeCommand) (BridgeCommand, error) {
+		sendCount++
+		return BridgeCommand{Cmd: "response", CID: command.CID, Payload: TypedValue{Kind: "string", Value: "ok"}}, nil
+	}, owner)
+
+	if _, err := bridge.Get(ctx, "state.value", cloneWireIdentity(t, owner)); err == nil {
+		t.Fatalf("unproved owner clone borrowed bound bridge identity")
+	}
+	guest.UUID = owner.UUID
+	if _, err := bridge.Get(ctx, "state.value", guest); err == nil {
+		t.Fatalf("same UUID with a different key borrowed bound bridge identity")
+	}
+	if sendCount != 0 {
+		t.Fatalf("denied requester substitution reached transport: sends=%d", sendCount)
+	}
+	if value, err := bridge.Get(ctx, "state.value", owner); err != nil || value != "ok" {
+		t.Fatalf("proved bound requester failed: value=%#v err=%v", value, err)
+	}
+	if sendCount != 1 {
+		t.Fatalf("proved request send count=%d", sendCount)
+	}
+}
+
+func TestResolverDoesNotShareIdentityScopedCellsOrBridgesAcrossUUIDCollisions(t *testing.T) {
+	ctx := context.Background()
+	ownerVault := NewInMemoryIdentityVault()
+	owner, _ := ownerVault.Identity(ctx, "owner", true)
+	attackerVault := NewInMemoryIdentityVault()
+	attacker, _ := attackerVault.Identity(ctx, "attacker", true)
+	attacker.UUID = owner.UUID
+
+	resolver := NewCellResolver()
+	if err := resolver.RegisterNamedEmitCell(ctx, "IdentityScoped", nil, RegisterOptions{
+		Scope: ScopeIdentityUnique,
+		Factory: func(ctx context.Context, identity *Identity) (CellProtocol, error) {
+			return NewGeneralCell(identity, "IdentityScoped"), nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ownerCell, err := resolver.CellAtEndpoint(ctx, "cell:///IdentityScoped", owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerCell, err := resolver.CellAtEndpoint(ctx, "cell:///IdentityScoped", attacker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ownerCell == attackerCell {
+		t.Fatalf("same UUID with a different signing key shared identity-scoped Cell")
+	}
+
+	ownerBridge := resolver.remoteBridge("wss://example.invalid/bridgehead/Protected", owner)
+	attackerBridge := resolver.remoteBridge("wss://example.invalid/bridgehead/Protected", attacker)
+	if ownerBridge == attackerBridge {
+		t.Fatalf("same UUID with a different signing key borrowed owner-bound CloudBridge")
+	}
+	wireCloneBridge := resolver.remoteBridge("wss://example.invalid/bridgehead/Protected", cloneWireIdentity(t, owner))
+	if ownerBridge == wireCloneBridge {
+		t.Fatalf("unproved wire clone borrowed owner-bound CloudBridge")
+	}
+}
+
 func TestResolverConcurrentIdentityAndScaffoldScopesAreUnique(t *testing.T) {
 	ctx := context.Background()
 	vault := NewInMemoryIdentityVault()

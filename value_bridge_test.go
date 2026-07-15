@@ -118,17 +118,18 @@ func TestGrantRejectsUnknownSwiftPermissionBits(t *testing.T) {
 
 func TestBridgeEndpointHandlesGetSetDescription(t *testing.T) {
 	ctx := context.Background()
-	cell := NewGeneralCell(nil, "Echo")
-	endpoint := NewBridgeEndpoint(cell, nil)
+	owner, _ := NewInMemoryIdentityVault().Identity(ctx, "bridge-owner", true)
+	cell := NewGeneralCell(owner, "Echo")
+	endpoint := NewBridgeEndpoint(cell, owner)
 
-	setResponse := endpoint.Handle(ctx, BridgeCommand{Cmd: "set", Payload: TypedValue{Kind: "keyValue", Value: KeyValue{Key: "state.value", Value: "ok"}}, CID: 1})
+	setResponse := endpoint.Handle(ctx, BridgeCommand{Cmd: "set", Identity: owner, Payload: TypedValue{Kind: "keyValue", Value: KeyValue{Key: "state.value", Value: "ok"}}, CID: 1})
 	typed := setResponse[0].Payload.(TypedValue)
 	response := typed.Value.(SetValueResponse)
 	if response.State != "ok" {
 		t.Fatalf("set response = %#v", response)
 	}
 
-	getResponse := endpoint.Handle(ctx, BridgeCommand{Cmd: "get", Payload: TypedValue{Kind: "string", Value: "state.value"}, CID: 2})
+	getResponse := endpoint.Handle(ctx, BridgeCommand{Cmd: "get", Identity: owner, Payload: TypedValue{Kind: "string", Value: "state.value"}, CID: 2})
 	if got := getResponse[0].Payload.(TypedValue).Value; got != "ok" {
 		t.Fatalf("get = %#v", got)
 	}
