@@ -7,7 +7,7 @@
 //	goscaffold probe -url ws://127.0.0.1:8080/bridgehead/<uuid>/Vault -allow-insecure-loopback
 //
 // serve hosts named Cells behind an authenticated /bridgehead route
-// (org.haven.bridge-channel.v1). probe connects as a fresh identity,
+// (org.haven.bridge-channel.v1) and the invitation landing under /i/. probe connects as a fresh identity,
 // authenticates, asks for the Cell description and prints it as JSON.
 package main
 
@@ -50,6 +50,7 @@ func serve(args []string) {
 	publicURL := flags.String("public-url", os.Getenv("GOCELL_PUBLIC_URL"), "this node's own origin, e.g. wss://node.example")
 	insecure := flags.Bool("allow-insecure-loopback", os.Getenv("GOCELL_ALLOW_INSECURE_LOOPBACK") == "1", "allow ws:// on a loopback public URL")
 	cells := flags.String("cells", "Echo,Vault", "comma-separated named Cells to host")
+	inviteRateLimit := flags.Bool("invite-rate-limit", os.Getenv("GOCELL_INVITE_RATE_LIMIT") != "0", "rate limit short-code lookups and replies on /i/, as Swift does")
 	_ = flags.Parse(args)
 
 	ctx := context.Background()
@@ -79,6 +80,10 @@ func serve(args []string) {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/bridgehead/", head)
+	// /i/... is the same invitation landing a Swift CellScaffold serves.
+	landing := cellprotocol.NewInviteLanding(nil)
+	landing.RateLimit = *inviteRateLimit
+	mux.Handle("/i/", landing)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"service":"goscaffold","status":"ok"}`))
