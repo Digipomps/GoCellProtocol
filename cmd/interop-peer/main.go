@@ -79,6 +79,9 @@ func (p *peer) handle(m message) (any, error) {
 		return map[string]any{"cell": "invitation"}, nil
 	case "serve":
 		return p.serve(m)
+	case "admit":
+		// Swift's owner signs an Agreement here; this ChatCell admits by the verified acceptance.
+		return map[string]any{"admittedBy": "acceptance"}, nil
 	case "call":
 		cell := p.cells[m.Cell]
 		if cell == nil {
