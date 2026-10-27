@@ -14,7 +14,8 @@ import (
 // Field tags: `wire:"key"` or `wire:"key,opt"`. An optional field is left
 // out when it is a nil pointer or a nil slice, like Swift's synthesized
 // Codable does for Optional. Supported field types: string, *string, int64,
-// float64, bool, []byte, []string, struct pointers and slices of structs.
+// float64, bool, []byte, []string, struct pointers, slices of structs, and
+// `any` for JSON passed through as decoded (DecodeJSON values).
 
 // Model is a wire model that knows which top-level keys its signature skips.
 type Model interface {
@@ -67,7 +68,7 @@ func ToWire(model any) (map[string]any, error) {
 			continue
 		}
 		field := value.Field(i)
-		if (field.Kind() == reflect.Pointer || field.Kind() == reflect.Slice) && field.IsNil() {
+		if (field.Kind() == reflect.Pointer || field.Kind() == reflect.Slice || field.Kind() == reflect.Interface) && field.IsNil() {
 			if tag.optional {
 				continue
 			}
@@ -125,6 +126,8 @@ func encodeField(field reflect.Value) (any, error) {
 		return items, nil
 	case reflect.Struct:
 		return ToWire(field.Addr().Interface())
+	case reflect.Interface:
+		return field.Interface(), nil
 	}
 	return nil, fmt.Errorf("unsupported field type %s", field.Type())
 }
@@ -252,6 +255,8 @@ func decodeField(raw any, field reflect.Value) error {
 		field.Set(out)
 	case reflect.Struct:
 		return FromWire(raw, field.Addr().Interface())
+	case reflect.Interface:
+		field.Set(reflect.ValueOf(raw))
 	default:
 		return fmt.Errorf("unsupported field type %s", field.Type())
 	}
@@ -269,6 +274,9 @@ func EncodedJSON(model any) ([]byte, error) {
 
 // SignedBytes is what Swift signs for model.
 func SignedBytes(model Model) ([]byte, error) {
+	if custom, ok := model.(interface{ signedBytes() ([]byte, error) }); ok {
+		return custom.signedBytes()
+	}
 	if challenge, ok := model.(*IdentitySigningChallenge); ok {
 		return EncodedJSON(challenge)
 	}

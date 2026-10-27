@@ -72,8 +72,9 @@ func loadFixtures(t *testing.T) (fixtureManifest, map[string]fixtureCase) {
 		if err := json.Unmarshal(data, &c); err != nil {
 			t.Fatal(err)
 		}
-		if c.Type == channelAuthFixtureType {
-			// Handshake vectors, not a wire model: replayed by the channel tests.
+		if ownTestTypes[c.Type] {
+			// Handshake vectors and the VC chain have their own tests
+			// (channel_test.go, identity_link_test.go).
 			continue
 		}
 		cases[c.ID] = c
@@ -82,6 +83,10 @@ func loadFixtures(t *testing.T) (fixtureManifest, map[string]fixtureCase) {
 }
 
 const channelAuthFixtureType = "BridgeChannelAuthV1"
+
+var ownTestTypes = map[string]bool{
+	channelAuthFixtureType: true, "VCClaim": true, "VCPresentation": true, "IdentityLinkCompletionEnvelope": true,
+}
 
 func b64(t *testing.T, text string) []byte {
 	t.Helper()
