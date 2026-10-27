@@ -40,6 +40,35 @@ value, err := bridge.Get(ctx, "state", identity)
 `ws://` is rejected by default. Enable `AllowInsecureWebSocket` only for local
 development.
 
+Current Swift bridgeheads admit a connection only after the
+`org.haven.bridge-channel.v1` handshake: the client signs a purpose-,
+audience-, nonce- and expiry-bound challenge with its vault key, and no
+`ready` frame is ever sent. Set `CloudBridgeOptions{Authenticate: true}` to
+speak it; `bridge.AdmittedChannel()` then holds the proven channel.
+
+## Bridgehead server
+
+`Bridgehead` serves Cells on `/bridgehead/:pubId/:bridgeId` with the same
+admission as Swift: nothing reaches a Cell before admission, and every later
+command must carry the admitted public key. Admission proves control of a key
+and grants no Cell permission; the Cell's own authorization still decides.
+The signed audience is the configured `PublicURL` plus the path, never the
+Host header; without it every connection is refused.
+
+```go
+head := cellprotocol.NewResolverBridgehead(resolver, owner, cellprotocol.BridgeheadOptions{
+    PublicURL: "wss://node.example",
+})
+http.Handle("/bridgehead/", head)
+```
+
+`cmd/goscaffold` is a small scaffold for cross-language tests:
+
+```bash
+go run ./cmd/goscaffold serve -addr 127.0.0.1:8090 -public-url ws://127.0.0.1:8090 -allow-insecure-loopback
+go run ./cmd/goscaffold probe -url ws://127.0.0.1:8090/bridgehead/<uuid>/Vault -allow-insecure-loopback
+```
+
 Live Swift/Vapor bridgehead smoke test:
 
 ```bash
@@ -60,8 +89,10 @@ copied from CellProtocol `fixtures/interop/v1`):
 go test ./interop
 ```
 
-These are contracts only. The cells that run the flows, and a bridgehead
-server for a Go scaffold, are not here yet.
+`interop/channel.go` is the bridge admission handshake; its tests replay the
+Swift vectors and show the Go server and client emit the same bytes. The cells
+that run the three flows on a Go scaffold, and Agreement admission, are not
+here yet.
 
 ## Upstream Monitoring
 

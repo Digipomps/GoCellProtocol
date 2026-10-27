@@ -131,7 +131,7 @@ func SortedKeys(keys []string, order KeyOrder) []string {
 	return out
 }
 
-func writeString(buf *bytes.Buffer, s string) {
+func writeString(buf *bytes.Buffer, s string, escapeSlashes bool) {
 	buf.WriteByte('"')
 	for _, r := range s {
 		switch r {
@@ -140,7 +140,11 @@ func writeString(buf *bytes.Buffer, s string) {
 		case '\\':
 			buf.WriteString(`\\`)
 		case '/':
-			buf.WriteString(`\/`)
+			if escapeSlashes {
+				buf.WriteString(`\/`)
+			} else {
+				buf.WriteByte('/')
+			}
 		case '\b':
 			buf.WriteString(`\b`)
 		case '\f':
@@ -170,11 +174,17 @@ func writeFloat(buf *bytes.Buffer, f float64) error {
 		buf.WriteString(strconv.FormatInt(int64(f), 10))
 		return nil
 	}
+	// Shortest round-trip digits, positional between 1e-4 and 1e16 like
+	// Swift's Double description (1793102399.123, not 1.793102399123e+09).
+	if abs := math.Abs(f); abs >= 1e-4 && abs < 1e16 {
+		buf.WriteString(strconv.FormatFloat(f, 'f', -1, 64))
+		return nil
+	}
 	buf.WriteString(strconv.FormatFloat(f, 'g', -1, 64))
 	return nil
 }
 
-func writeValue(buf *bytes.Buffer, value any, order KeyOrder) error {
+func writeValue(buf *bytes.Buffer, value any, order KeyOrder, escapeSlashes bool) error {
 	switch v := value.(type) {
 	case nil:
 		buf.WriteString("null")
@@ -185,7 +195,7 @@ func writeValue(buf *bytes.Buffer, value any, order KeyOrder) error {
 			buf.WriteString("false")
 		}
 	case string:
-		writeString(buf, v)
+		writeString(buf, v, escapeSlashes)
 	case int:
 		buf.WriteString(strconv.Itoa(v))
 	case int64:
@@ -212,9 +222,9 @@ func writeValue(buf *bytes.Buffer, value any, order KeyOrder) error {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			writeString(buf, key)
+			writeString(buf, key, escapeSlashes)
 			buf.WriteByte(':')
-			if err := writeValue(buf, v[key], order); err != nil {
+			if err := writeValue(buf, v[key], order, escapeSlashes); err != nil {
 				return err
 			}
 		}
@@ -225,7 +235,7 @@ func writeValue(buf *bytes.Buffer, value any, order KeyOrder) error {
 			if i > 0 {
 				buf.WriteByte(',')
 			}
-			if err := writeValue(buf, item, order); err != nil {
+			if err := writeValue(buf, item, order, escapeSlashes); err != nil {
 				return err
 			}
 		}
@@ -235,7 +245,7 @@ func writeValue(buf *bytes.Buffer, value any, order KeyOrder) error {
 		for i, item := range v {
 			items[i] = item
 		}
-		return writeValue(buf, items, order)
+		return writeValue(buf, items, order, escapeSlashes)
 	default:
 		return fmt.Errorf("interop: cannot encode %T", value)
 	}
@@ -245,7 +255,17 @@ func writeValue(buf *bytes.Buffer, value any, order KeyOrder) error {
 // CanonicalJSON encodes a JSON value exactly like Foundation with .sortedKeys.
 func CanonicalJSON(value any, order KeyOrder) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := writeValue(&buf, value, order); err != nil {
+	if err := writeValue(&buf, value, order, true); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// UnescapedSlashJSON is JSONEncoder with .sortedKeys and
+// .withoutEscapingSlashes: code-point key order, "/" written as is.
+func UnescapedSlashJSON(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := writeValue(&buf, value, EncoderOrder, false); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

@@ -38,6 +38,8 @@ type webSocketClient struct {
 	reader   *bufio.Reader
 	writeMu  sync.Mutex
 	maxBytes int64
+	// server connections send unmasked frames (RFC 6455 section 5.1).
+	server bool
 }
 
 type webSocketDialOptions struct {
@@ -163,7 +165,7 @@ func (c *webSocketClient) SendText(ctx context.Context, message []byte) error {
 		_ = c.conn.SetWriteDeadline(deadline)
 		defer c.conn.SetWriteDeadline(time.Time{})
 	}
-	return writeWebSocketFrame(c.conn, webSocketOpcodeText, message, true)
+	return writeWebSocketFrame(c.conn, webSocketOpcodeText, message, !c.server)
 }
 
 func (c *webSocketClient) ReadMessage() ([]byte, error) {
@@ -188,7 +190,7 @@ func (c *webSocketClient) ReadMessage() ([]byte, error) {
 			return fragments, nil
 		case webSocketOpcodePing:
 			c.writeMu.Lock()
-			err := writeWebSocketFrame(c.conn, webSocketOpcodePong, payload, true)
+			err := writeWebSocketFrame(c.conn, webSocketOpcodePong, payload, !c.server)
 			c.writeMu.Unlock()
 			if err != nil {
 				return nil, err
@@ -197,7 +199,7 @@ func (c *webSocketClient) ReadMessage() ([]byte, error) {
 			continue
 		case webSocketOpcodeClose:
 			c.writeMu.Lock()
-			_ = writeWebSocketFrame(c.conn, webSocketOpcodeClose, payload, true)
+			_ = writeWebSocketFrame(c.conn, webSocketOpcodeClose, payload, !c.server)
 			c.writeMu.Unlock()
 			return nil, io.EOF
 		default:
@@ -208,9 +210,69 @@ func (c *webSocketClient) ReadMessage() ([]byte, error) {
 
 func (c *webSocketClient) Close() error {
 	c.writeMu.Lock()
-	_ = writeWebSocketFrame(c.conn, webSocketOpcodeClose, nil, true)
+	_ = writeWebSocketFrame(c.conn, webSocketOpcodeClose, nil, !c.server)
 	c.writeMu.Unlock()
 	return c.conn.Close()
+}
+
+// closeWithCode sends a close frame carrying a status code, then closes.
+func (c *webSocketClient) closeWithCode(code uint16) error {
+	var payload [2]byte
+	binary.BigEndian.PutUint16(payload[:], code)
+	c.writeMu.Lock()
+	_ = writeWebSocketFrame(c.conn, webSocketOpcodeClose, payload[:], !c.server)
+	c.writeMu.Unlock()
+	return c.conn.Close()
+}
+
+// acceptWebSocket upgrades an HTTP request to a server-side WebSocket.
+func acceptWebSocket(w http.ResponseWriter, r *http.Request, maxBytes int64) (*webSocketClient, error) {
+	if r.Method != http.MethodGet ||
+		!headerHasToken(r.Header, "Connection", "upgrade") ||
+		!headerHasToken(r.Header, "Upgrade", "websocket") ||
+		r.Header.Get("Sec-WebSocket-Version") != "13" {
+		http.Error(w, "websocket upgrade required", http.StatusBadRequest)
+		return nil, fmt.Errorf("not a websocket upgrade")
+	}
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if decoded, err := base64.StdEncoding.DecodeString(key); err != nil || len(decoded) != 16 {
+		http.Error(w, "bad websocket key", http.StatusBadRequest)
+		return nil, fmt.Errorf("bad websocket key")
+	}
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "websocket unsupported", http.StatusInternalServerError)
+		return nil, fmt.Errorf("response writer cannot hijack")
+	}
+	conn, buffered, err := hijacker.Hijack()
+	if err != nil {
+		return nil, err
+	}
+	response := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+		webSocketAcceptKey(key) + "\r\n\r\n"
+	if _, err := buffered.WriteString(response); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := buffered.Flush(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if maxBytes <= 0 {
+		maxBytes = defaultWebSocketMaxMessageBytes
+	}
+	return &webSocketClient{conn: conn, reader: buffered.Reader, maxBytes: maxBytes, server: true}, nil
+}
+
+func headerHasToken(header http.Header, name, token string) bool {
+	for _, value := range header.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func webSocketAcceptKey(key string) string {
