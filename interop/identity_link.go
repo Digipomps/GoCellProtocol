@@ -760,3 +760,109 @@ func ApproveEnrollment(envelope *IdentityLinkApprovalEnvelope, issuer IdentityPu
 	}
 	return &IdentityLinkApprovalPackage{Approval: approval, SameEntityCredential: *credential, IssuerIdentity: issuer}, nil
 }
+
+// ---- Genesis seal (EntityGenesis.swift) -----------------------------------------
+
+const (
+	SealKeypath       = "identityLinks.genesis"
+	RecordsKeypath    = "identityLinks.records"
+	GenesisLinkPrefix = "genesis-"
+	AnchorReference   = "cell:///EntityAnchor"
+	SameEntityScope   = "same_entity"
+)
+
+var GenesisTriggers = []string{"onboarding", "addressBookImport", "verifiableCredential", "fileUpload", "directEdit", "firstPersist"}
+
+// EntityGenesisSeal is stored at identityLinks.genesis; its presence means the
+// anchor is sealed.
+type EntityGenesisSeal struct {
+	Version               int64                            `wire:"version"`
+	AnchorID              string                           `wire:"anchorID"`
+	SealedAt              string                           `wire:"sealedAt"`
+	Trigger               string                           `wire:"trigger"`
+	LinkID                string                           `wire:"linkID"`
+	InitiatorIdentityUUID string                           `wire:"initiatorIdentityUUID"`
+	Proof                 *IdentityEnrollmentApprovalProof `wire:"proof,opt"`
+}
+
+func (*EntityGenesisSeal) ExcludedFromSignature() []string { return []string{"proof"} }
+
+func GenesisLinkID(anchorID string) string { return GenesisLinkPrefix + anchorID }
+
+func IsGenesisLink(linkID string) bool { return strings.HasPrefix(linkID, GenesisLinkPrefix) }
+
+func IsImmutableGenesisKeypath(keypath string) bool {
+	return keypath == SealKeypath || strings.HasPrefix(keypath, SealKeypath+".")
+}
+
+var unsafeRecordKey = regexp.MustCompile(`[^A-Za-z0-9_-]`)
+
+func SafeRecordKey(linkID string) string { return unsafeRecordKey.ReplaceAllString(linkID, "_") }
+
+func RecordKeypath(linkID string) string { return RecordsKeypath + "." + SafeRecordKey(linkID) }
+
+func GenesisRecord(anchorID string, initiator IdentityPublicKeyDescriptor, identityDomain, sealedAt string) IdentityLinkRecord {
+	reference := AnchorReference
+	return IdentityLinkRecord{
+		LinkID:                   GenesisLinkID(anchorID),
+		EntityBinding:            EntityBindingDescriptor{Mode: "localEntityAnchor", EntityAnchorReference: &reference},
+		LinkedIdentity:           initiator,
+		ApprovedDomains:          []string{identityDomain},
+		ApprovedIdentityContexts: []string{},
+		ApprovedScopes:           []string{SameEntityScope},
+		IssuerIdentityUUID:       initiator.UUID,
+		IssuerType:               "existingDevice",
+		Status:                   "active",
+		LinkedAt:                 sealedAt,
+	}
+}
+
+// SealGenesis is EntityGenesisService.seal. The caller must already have
+// proven that initiator owns the anchor.
+func SealGenesis(anchorID string, initiator IdentityPublicKeyDescriptor, sign func([]byte) ([]byte, error),
+	identityDomain, trigger string, now time.Time) (*EntityGenesisSeal, *IdentityLinkRecord, error) {
+	known := false
+	for _, t := range GenesisTriggers {
+		known = known || t == trigger
+	}
+	if !known {
+		return nil, nil, fail("invalidTrigger", trigger)
+	}
+	seal := &EntityGenesisSeal{
+		Version: 1, AnchorID: anchorID, SealedAt: ISO8601(now), Trigger: trigger,
+		LinkID: GenesisLinkID(anchorID), InitiatorIdentityUUID: initiator.UUID,
+		Proof: &IdentityEnrollmentApprovalProof{Type: "signature", IssuerIdentityUUID: initiator.UUID, IssuerType: "existingDevice",
+			Algorithm: initiator.Algorithm, CurveType: initiator.CurveType},
+	}
+	payload, err := SignedBytes(seal)
+	if err != nil {
+		return nil, nil, err
+	}
+	if seal.Proof.Signature, err = sign(payload); err != nil {
+		return nil, nil, err
+	}
+	record := GenesisRecord(anchorID, initiator, identityDomain, seal.SealedAt)
+	return seal, &record, nil
+}
+
+// VerifyGenesis is EntityGenesisService.verify: both come from storage, so
+// neither is trusted on its own.
+func VerifyGenesis(seal *EntityGenesisSeal, record *IdentityLinkRecord) error {
+	switch {
+	case seal.LinkID != record.LinkID:
+		return fail("sealDoesNotMatchRecord", "linkID")
+	case seal.InitiatorIdentityUUID != record.LinkedIdentity.UUID || seal.InitiatorIdentityUUID != record.IssuerIdentityUUID:
+		return fail("sealDoesNotMatchRecord", "initiator")
+	case record.EntityBinding.Mode != "localEntityAnchor":
+		return fail("sealDoesNotMatchRecord", "entityBinding")
+	case record.IssuerType != "existingDevice" || record.Status != "active":
+		return fail("sealDoesNotMatchRecord", "record")
+	case seal.Proof == nil || seal.Proof.Signature == nil:
+		return fail("sealProofInvalid")
+	}
+	payload, err := SignedBytes(seal)
+	if err != nil || !VerifySignature(seal.Proof.Signature, payload, record.LinkedIdentity) {
+		return fail("sealProofInvalid")
+	}
+	return nil
+}

@@ -51,12 +51,12 @@ func loadLinkFixtures(t *testing.T) linkFixtures {
 			t.Fatal(err)
 		}
 		switch c.Type {
-		case "VCClaim", "VCPresentation", "IdentityLinkCompletionEnvelope":
+		case "VCClaim", "VCPresentation", "IdentityLinkCompletionEnvelope", "EntityGenesisSeal":
 			out.cases[c.ID] = c
 		}
 	}
-	if len(out.cases) != 11 {
-		t.Fatalf("want 11 VC chain cases, got %d", len(out.cases))
+	if len(out.cases) != 14 {
+		t.Fatalf("want 14 VC chain and genesis cases, got %d", len(out.cases))
 	}
 	return out
 }
@@ -71,6 +71,8 @@ func decodeLinkModel(t *testing.T, c fixtureCase) Model {
 		model = &VCPresentation{}
 	case "IdentityLinkCompletionEnvelope":
 		model = &IdentityLinkCompletionEnvelope{}
+	case "EntityGenesisSeal":
+		model = &EntityGenesisSeal{}
 	}
 	if err := Decode(b64(t, c.EncodedBase64), model); err != nil {
 		t.Fatalf("%s: %v", c.ID, err)
@@ -114,6 +116,12 @@ func TestLinkFixturesVerdictsMatchSwift(t *testing.T) {
 			verdict = map[bool]string{true: "valid", false: "invalid"}[model.Verify(f.descriptors["alice"])]
 		case *VCPresentation:
 			verdict = map[bool]string{true: "valid", false: "invalid"}[model.VerifyHolderProof(challenge, "staging.haven.digipomps.org")]
+		case *EntityGenesisSeal:
+			var record IdentityLinkRecord
+			if err := Decode(b64(t, c.Related["recordBase64"]), &record); err != nil {
+				t.Fatal(err)
+			}
+			verdict = VerdictOf(VerifyGenesis(model, &record))
 		case *IdentityLinkCompletionEnvelope:
 			result, err := VerifyCompletion(model, f.verifyAt, nil, nil)
 			verdict = VerdictOf(err)
@@ -235,4 +243,26 @@ func TestGoApproverAndNewKeyCompleteALink(t *testing.T) {
 		t.Fatalf("record = %+v", result.Record)
 	}
 	_ = base64.StdEncoding
+}
+
+func TestGoBuiltGenesisSealEqualsSwift(t *testing.T) {
+	f := loadLinkFixtures(t)
+	c := f.cases["extend.genesis.valid"]
+	swift := decodeLinkModel(t, c).(*EntityGenesisSeal)
+	sealedAt, _ := ParseISO8601(swift.SealedAt)
+	seal, record, err := SealGenesis(swift.AnchorID, f.descriptors["alice"], signerFunc(f.keys["alice"]), "private", "onboarding", sealedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := EncodedJSON(seal)
+	if !bytes.Equal(got, b64(t, c.EncodedBase64)) {
+		t.Fatalf("seal differs\n got %s", got)
+	}
+	gotRecord, _ := EncodedJSON(record)
+	if !bytes.Equal(gotRecord, b64(t, c.Related["recordBase64"])) {
+		t.Fatalf("record differs\n got %s", gotRecord)
+	}
+	if RecordKeypath(record.LinkID) != c.Related["recordKeypath"] {
+		t.Fatalf("record keypath %s", RecordKeypath(record.LinkID))
+	}
 }

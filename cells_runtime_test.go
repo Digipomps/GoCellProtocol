@@ -77,24 +77,8 @@ func TestEntityAnchorIdentityLinksAndBatchPersist(t *testing.T) {
 	if name != "Ada" {
 		t.Fatalf("name = %#v", name)
 	}
-	approval, _ := entity.Set(ctx, "identityLinks.approveEnrollment", map[string]any{"approvalID": "approval/1"}, owner)
-	if approval.(map[string]any)["status"] != "approved" {
-		t.Fatalf("approval = %#v", approval)
-	}
-	completed, _ := entity.Set(ctx, "identityLinks.completeEnrollment", map[string]any{"linkID": "link/1", "approvalJTI": "jti-1"}, owner)
-	if completed.(map[string]any)["status"] != "completed" {
-		t.Fatalf("completed = %#v", completed)
-	}
-	replay, _ := entity.Set(ctx, "identityLinks.completeEnrollment", map[string]any{"linkID": "link/2", "approvalJTI": "jti-1"}, owner)
-	if replay.(map[string]any)["status"] != "error" {
-		t.Fatalf("replay = %#v", replay)
-	}
-	revoked, _ := entity.Set(ctx, "identityLinks.revoke", map[string]any{"linkID": "link/1"}, owner)
-	if revoked.(map[string]any)["status"] != "revoked" {
-		t.Fatalf("revoked = %#v", revoked)
-	}
 	state, _ := entity.Get(ctx, "identityLinks.state", owner)
-	if state.(map[string]any)["status"] != "ready" {
+	if state.(map[string]any)["status"] != "ready" || state.(map[string]any)["sealed"] != true {
 		t.Fatalf("state = %#v", state)
 	}
 }

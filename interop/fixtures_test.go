@@ -86,6 +86,7 @@ const channelAuthFixtureType = "BridgeChannelAuthV1"
 
 var ownTestTypes = map[string]bool{
 	channelAuthFixtureType: true, "VCClaim": true, "VCPresentation": true, "IdentityLinkCompletionEnvelope": true,
+	"EntityGenesisSeal": true,
 }
 
 func b64(t *testing.T, text string) []byte {
