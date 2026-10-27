@@ -47,6 +47,22 @@ CELLPROTOCOL_STAGING_BRIDGE_URL=wss://staging.haven.digipomps.org/bridgehead/<cl
   go test ./... -run TestCloudBridgeStagingSmoke -count=1
 ```
 
+## Cross-language contracts (`interop`)
+
+Package `github.com/Digipomps/GoCellProtocol/interop` holds wire models,
+canonical encoding and verifiers for the three flows that must work between
+Swift, Python and Go scaffolds: entity extension, invitation and chat, plus the
+identity proof a bridge asks for. They reproduce Swift byte for byte and are
+tested against the golden fixtures Swift generates (`interop/testdata/v1`,
+copied from CellProtocol `fixtures/interop/v1`):
+
+```bash
+go test ./interop
+```
+
+These are contracts only. The cells that run the flows, and a bridgehead
+server for a Go scaffold, are not here yet.
+
 ## Upstream Monitoring
 
 The `CellProtocol Upstream Monitor` GitHub Actions workflow checks
