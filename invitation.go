@@ -313,7 +313,7 @@ func (c *InvitationCell) write(ctx context.Context, keypath string, value any, r
 	case "invite.revoke":
 		return c.revoke(ctx, value), nil
 	case "invite.verify":
-		return c.verify(value), nil
+		return c.verify(ctx, value), nil
 	case "invite.clearOutbox":
 		return c.clearOutbox(value), nil
 	case "invite.respond":
@@ -801,7 +801,39 @@ func (c *InvitationCell) revoke(ctx context.Context, value any) map[string]any {
 	return c.done(extOK("Invitasjonen er trukket tilbake. "+remote, true, map[string]any{"ticketID": ticketID}))
 }
 
-func (c *InvitationCell) verify(value any) map[string]any {
+// resolveToken returns the ticket token behind a link and the landing base.
+// A short code is looked up at the landing that holds it.
+func (c *InvitationCell) resolveToken(ctx context.Context, link string, payload map[string]any) (string, string, map[string]any) {
+	token, err := interop.TokenFromLink(link)
+	if err != nil {
+		failure := err.(*interop.LinkFailure)
+		return "", "", extError(failure.Code, failure.Message, nil)
+	}
+	base := ""
+	if parsed, err := url.Parse(strings.TrimSpace(link)); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+		base = parsed.Scheme + "://" + parsed.Host
+	}
+	if base == "" {
+		base = extString(payload["landingBase"])
+	}
+	if base == "" && len(c.bases()) > 0 {
+		base = c.bases()[0]
+	}
+	if interop.LooksLikeHumanCode(token) {
+		if base == "" {
+			return "", "", extError("not_configured", "En kort kode trenger adressen til scaffoldet som holder invitasjonen.", nil)
+		}
+		status, answer := c.opts.Transport(ctx, http.MethodGet, strings.Trim(base, " /")+"/i/"+token, nil)
+		obj, _ := answer.(map[string]any)
+		if !ok2xx(status) || extString(obj["ticketToken"]) == "" {
+			return "", "", extError("not_available", rejectedText(status, answer), nil)
+		}
+		token = extString(obj["ticketToken"])
+	}
+	return token, base, nil
+}
+
+func (c *InvitationCell) verify(ctx context.Context, value any) map[string]any {
 	payload := payloadObject(value)
 	link := extString(value)
 	if link == "" {
@@ -809,10 +841,12 @@ func (c *InvitationCell) verify(value any) map[string]any {
 	}
 	var ticket *interop.HavenInviteTicket
 	if link != "" {
-		token, err := interop.TokenFromLink(link)
-		if err == nil {
-			ticket, err = interop.DecodeTicketToken(token)
+		token, _, problem := c.resolveToken(ctx, link, payload)
+		if problem != nil {
+			return problem
 		}
+		var err error
+		ticket, err = interop.DecodeTicketToken(token)
 		if err != nil {
 			failure := err.(*interop.LinkFailure)
 			return extError(failure.Code, failure.Message, nil)
@@ -865,31 +899,9 @@ func (c *InvitationCell) respond(ctx context.Context, value any) map[string]any 
 	if link == "" {
 		return c.fail(extError("bad_request", "Send `link`: invitasjonslenken du fikk.", nil))
 	}
-	token, err := interop.TokenFromLink(link)
-	if err != nil {
-		failure := err.(*interop.LinkFailure)
-		return c.fail(extError(failure.Code, failure.Message, nil))
-	}
-	base := ""
-	if parsed, err := url.Parse(strings.TrimSpace(link)); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
-		base = parsed.Scheme + "://" + parsed.Host
-	}
-	if base == "" {
-		base = extString(payload["landingBase"])
-	}
-	if base == "" && len(c.bases()) > 0 {
-		base = c.bases()[0]
-	}
-	if interop.LooksLikeHumanCode(token) {
-		if base == "" {
-			return c.fail(extError("not_configured", "En kort kode trenger adressen til scaffoldet som holder invitasjonen.", nil))
-		}
-		status, answer := c.opts.Transport(ctx, http.MethodGet, strings.Trim(base, " /")+"/i/"+token, nil)
-		obj, _ := answer.(map[string]any)
-		if !ok2xx(status) || extString(obj["ticketToken"]) == "" {
-			return c.fail(extError("not_available", rejectedText(status, answer), nil))
-		}
-		token = extString(obj["ticketToken"])
+	token, base, problem := c.resolveToken(ctx, link, payload)
+	if problem != nil {
+		return c.fail(problem)
 	}
 	ticket, err := interop.DecodeTicketToken(token)
 	if err != nil {
