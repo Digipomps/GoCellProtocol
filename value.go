@@ -431,7 +431,26 @@ func (r *SetValueResponse) UnmarshalJSON(data []byte) error {
 }
 
 type AgreementTemplate struct {
-	Grants []Grant `json:"grants"`
+	Grants     []Grant     `json:"grants"`
+	Conditions []Condition `json:"conditions"`
+	Duration   int         `json:"duration"`
+}
+
+// CheckGrant is Swift's Agreement.checkGrant on the template: some grant covers the request exactly.
+func (t AgreementTemplate) CheckGrant(requested Grant) bool {
+	for _, grant := range t.Grants {
+		if grant.CoversExactly(requested) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t AgreementTemplate) duration() int {
+	if t.Duration <= 0 {
+		return DefaultAgreementDuration
+	}
+	return t.Duration
 }
 
 func (t *AgreementTemplate) AddGrant(permission, keypath string) {

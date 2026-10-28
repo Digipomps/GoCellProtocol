@@ -9,19 +9,19 @@ package cellprotocol
 // (ChatInvitationProofUtility), the composer, and the chat.message /
 // chat.participant / chat.status flow events.
 //
-// Who may use the cell:
-//   - the owner, proven as for every Go cell;
-//   - an invited identity once it has accepted: the owner signs a
-//     ChatInvitationArtifact for it (audience.generateInvitationArtifacts),
-//     the invitee signs a ChatInvitationAcceptance on its own node
-//     (audience.generateInvitationAcceptance), and anyone may hand both to
-//     audience.acceptInvitationArtifact, which checks both signatures. From
-//     then on that identity's key may read and send. Revoking takes it away.
-//
-// Swift reaches the same result through its Agreement grants; Go has no
-// Agreement admission yet, so the verified acceptance is what admits here. A
-// member is recognised by its signing key, which the authenticated bridge
-// checks on every command.
+// Who may use the cell is decided, as in Swift, by the conditions in its
+// Agreement. The owner sets them with audience.admissionConditions:
+//   - "invitationAccepted": the requester has handed in its signed invitation
+//     (ChatInvitationArtifact from the owner) and its signed acceptance
+//     (ChatInvitationAcceptance) at audience.acceptInvitationArtifact;
+//   - "member": the owner has accepted the requester's invitation.
+// Each is a lookup condition on target.audience.admission.<name>. A requester
+// fetches the template (description), asks for the grants it needs, and the
+// cell signs a contract when the conditions hold. Every access re-checks the
+// contract and its conditions, so revoking an invitation ends access at once.
+// With no conditions only the owner can approve a request. A requester is
+// recognised by its signing key, which the authenticated bridge checks on
+// every command.
 //
 // Not ported: end-to-end encrypted envelopes (crypto.* says plaintext only),
 // rekey tracking, the invitation ledger history and the demo emitter.
@@ -40,6 +40,11 @@ import (
 	"github.com/Digipomps/GoCellProtocol/interop"
 )
 
+// ChatAdmissionCondition is the Agreement condition for one admission name.
+func ChatAdmissionCondition(name string) Condition {
+	return NewLookupCondition("target.audience.admission."+name, true)
+}
+
 var (
 	chatReadKeys = []string{"status", "state", "messages", "participants", "members", "audience", "audience.mode",
 		"audience.inheritedRecipients", "audience.invitedRecipients", "audience.resolvedRecipients",
@@ -50,12 +55,36 @@ var (
 		"audience.inspectInvitationArtifact", "audience.acceptInvites", "audience.declineInvites",
 		"audience.revokeInvites", "audience.clearInvites", "compose.body", "compose.contentType",
 		"sendMessage", "addMessage", "sendComposedMessage", "clearComposer"}
-	chatMemberKeys = map[string]bool{"status": true, "state": true, "messages": true, "participants": true, "members": true,
-		"audience": true, "audience.mode": true, "audience.inheritedRecipients": true, "audience.invitedRecipients": true,
-		"audience.resolvedRecipients": true, "compose.body": true, "compose.contentType": true, "compose.state": true,
-		"compose.availableFormats": true, "crypto": true, "crypto.state": true,
-		"sendMessage": true, "addMessage": true, "sendComposedMessage": true, "clearComposer": true}
-	chatOpenKeys    = map[string]bool{"audience.acceptInvitationArtifact": true, "audience.inspectInvitationArtifact": true}
+	// chatTemplateGrants is Swift ChatCell's Agreement template, grant for grant.
+	chatTemplateGrants = [][2]string{
+		{"r---", "feed"}, {"rw--", "chat"}, {"rw--", "status"}, {"rw--", "state"}, {"rw--", "messages"},
+		{"rw--", "participants"}, {"rw--", "members"}, {"rw--", "audience"}, {"rw--", "audience.mode"},
+		{"r---", "audience.inheritedRecipients"}, {"r---", "audience.invitedRecipients"},
+		{"r---", "audience.resolvedRecipients"}, {"r---", "audience.invitations"}, {"r---", "audience.invitationLedger"},
+		{"r---", "audience.invitationArtifacts"}, {"-w--", "audience.inspectInvitationArtifact"},
+		{"rw--", "audience.inviteIdentities"}, {"rw--", "audience.generateInvitationArtifacts"},
+		{"rw--", "audience.generateInvitationAcceptance"}, {"rw--", "audience.acceptInvitationArtifact"},
+		{"rw--", "audience.acceptInvites"}, {"rw--", "audience.declineInvites"}, {"rw--", "audience.revokeInvites"},
+		{"rw--", "audience.removeContextMembers"}, {"rw--", "audience.clearInvites"}, {"rw--", "compose"},
+		{"rw--", "compose.body"}, {"rw--", "compose.contentType"}, {"rw--", "compose.state"}, {"rw--", "compose.previewRows"},
+		{"r---", "crypto"}, {"r---", "crypto.state"}, {"r---", "crypto.policy"}, {"r---", "crypto.supportedSuites"},
+		{"r---", "crypto.recipients"}, {"r---", "crypto.membership"}, {"r---", "crypto.rekeyStatus"},
+		{"r---", "crypto.persistencePolicy"}, {"r---", "crypto.persistenceMode"}, {"r---", "crypto.encryptedMessages"},
+		{"r---", "crypto.draftEnvelope"}, {"rw--", "crypto.persistenceMode"}, {"rw--", "crypto.requestRekey"},
+		{"rw--", "crypto.prepareDraftEnvelope"}, {"rw--", "crypto.openEnvelope"}, {"rw--", "crypto.clearDraftEnvelope"},
+		{"rw--", "crypto.clearEncryptedMessages"}, {"rw--", "sendMessage"}, {"rw--", "sendComposedMessage"},
+		{"rw--", "clearComposer"}, {"rw--", "addMessage"}, {"rw--", "start"}, {"rw--", "stop"},
+	}
+	// ChatAdmissionConditions are the conditions an owner can put in the
+	// Agreement. Each reads audience.admission.<name> on the chat.
+	ChatAdmissionConditions = []string{"invitationAccepted", "member"}
+	// Usable before a contract: the admission keys answer only for the
+	// requester, and an artifact with its acceptance carries the owner's and
+	// the invitee's signatures.
+	chatOpenBeforeAdmission = map[string]string{
+		"audience.admission.invitationAccepted": "r---", "audience.admission.member": "r---",
+		"audience.acceptInvitationArtifact": "-w--", "audience.inspectInvitationArtifact": "-w--",
+	}
 	chatAudienceMod = map[string][2]string{
 		"contextMembers":    {"Context members", "Bruk kjente deltakere og kontekstmedlemmer som mottakere."},
 		"invitedIdentities": {"Invited identities", "Bruk bare eksplisitt inviterte identities som mottakere."},
@@ -192,54 +221,191 @@ func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
 	if owner != nil {
 		cell.ownerPerson = chatPersonFromIdentity(owner)
 	}
+	for _, grant := range chatTemplateGrants {
+		cell.agreementTemplate.AddGrant(grant[0], grant[1])
+	}
 	for _, key := range chatReadKeys {
-		cell.agreementTemplate.AddGrant("r---", key)
 		cell.AddGetHandler(key, cell.read)
 	}
 	for _, key := range chatWriteKeys {
-		cell.agreementTemplate.AddGrant("rw--", key)
 		cell.AddSetHandler(key, cell.write)
 	}
+	for _, name := range ChatAdmissionConditions {
+		cell.AddGetHandler("audience.admission."+name, cell.admission)
+	}
+	cell.AddGetHandler("audience.admissionConditions", cell.admission)
+	cell.AddSetHandler("audience.admissionConditions", cell.setAdmissionConditions)
+	cell.SetConditionTarget(cell)
 	return cell
 }
 
 // ---- access --------------------------------------------------------------------
 
+// memberFor is the accepted invitee requester is, by uuid and signing key.
+// It says who; it grants nothing. Caller holds stateMu.
 func (c *ChatCell) memberFor(requester *Identity) *chatPerson {
-	for _, record := range c.invitations {
-		if record.status == "accepted" && record.acceptance != nil && record.person.matches(requester) {
-			return record.person
-		}
+	if requester == nil {
+		return nil
+	}
+	record, ok := c.invitations[requester.UUID]
+	if ok && record.status == "accepted" && record.person.matches(requester) {
+		return record.person
 	}
 	return nil
 }
 
-// admitsDirectly is true for open keys and for accepted members on member
-// keys; everything else goes through GeneralCell's owner proof.
-func (c *ChatCell) admitsDirectly(keypath string, requester *Identity) bool {
-	if chatOpenKeys[keypath] {
-		return true
+// validate is Swift ChatCell's access: the owner; the keys open before
+// admission; otherwise a contract, where the dispatcher accepts the exact key
+// or its root and the handler the exact key or "chat".
+func (c *ChatCell) validate(ctx context.Context, operation, keypath string, requester *Identity) error {
+	owner := c.ownerIdentity()
+	if owner == nil || (requester != nil && requester.UUID == owner.UUID) {
+		return c.GeneralCell.ValidateAccess(ctx, operation, keypath, requester)
 	}
-	if !chatMemberKeys[keypath] {
-		return false
+	permission := swiftPermission(operation)
+	if chatOpenBeforeAdmission[keypath] == permission {
+		return nil
 	}
-	c.stateMu.Lock()
-	defer c.stateMu.Unlock()
-	return c.memberFor(requester) != nil
+	denied := fmt.Errorf("access denied: no contract for %s grants %s on %s", identityLabel(requester), permission, keypath)
+	if keypath == "audience.admissionConditions" && permission == "-w--" {
+		return denied // the owner's alone, whatever "audience" grants say
+	}
+	root, _, _ := strings.Cut(keypath, ".")
+	dispatch := c.ContractAllows(ctx, permission, keypath, requester) ||
+		(root != keypath && c.ContractAllows(ctx, permission, root, requester))
+	if dispatch && (c.ContractAllows(ctx, permission, keypath, requester) || c.ContractAllows(ctx, permission, "chat", requester)) {
+		return nil
+	}
+	return denied
 }
 
 func (c *ChatCell) Get(ctx context.Context, keypath string, requester *Identity) (any, error) {
-	if c.admitsDirectly(keypath, requester) {
-		return c.read(ctx, keypath, requester)
+	if keypath == "description" || keypath == "keys" {
+		return c.GeneralCell.Get(ctx, keypath, requester)
 	}
-	return c.GeneralCell.Get(ctx, keypath, requester)
+	if err := c.validate(ctx, "read", keypath, requester); err != nil {
+		return nil, err
+	}
+	if handler := c.handlerForGet(keypath); handler != nil {
+		return handler(ctx, keypath, requester)
+	}
+	return nil, nil
 }
 
 func (c *ChatCell) Set(ctx context.Context, keypath string, value any, requester *Identity) (any, error) {
-	if c.admitsDirectly(keypath, requester) {
-		return c.write(ctx, keypath, value, requester)
+	if err := c.validate(ctx, "write", keypath, requester); err != nil {
+		return nil, err
 	}
-	return c.GeneralCell.Set(ctx, keypath, value, requester)
+	if handler := c.handlerForSet(keypath); handler != nil {
+		return handler(ctx, keypath, value, requester)
+	}
+	return nil, nil
+}
+
+// ---- admission -----------------------------------------------------------------
+
+// AdmissionConditionHolds is what audience.admission.<name> answers for requester.
+func (c *ChatCell) AdmissionConditionHolds(name string, requester *Identity) bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	member := c.memberFor(requester)
+	if member == nil {
+		return false
+	}
+	if name == "member" {
+		return true
+	}
+	if name != "invitationAccepted" {
+		return false
+	}
+	record := c.invitations[member.uuid]
+	if record.artifact == nil || record.acceptance == nil {
+		return false
+	}
+	consumed, ok := c.consumed[record.artifact.InvitationID]
+	if !ok || consumed["acceptanceID"] != record.acceptance.AcceptanceID {
+		return false
+	}
+	return interop.VerifyChatInvitation(record.artifact, c.opts.Clock(), interop.ChatOptions{}) == nil
+}
+
+// AdmissionConditions are the admission names in the Agreement template.
+func (c *ChatCell) AdmissionConditions() []string {
+	names := []string{}
+	for _, condition := range c.TemplateConditions() {
+		if condition.Lookup == nil {
+			continue
+		}
+		name, ok := strings.CutPrefix(condition.Lookup.Keypath, "target.audience.admission.")
+		if ok && chatAdmissionName(name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// ApplyAdmissionConditions replaces the Agreement's conditions; contracts
+// signed under others stop matching.
+func (c *ChatCell) ApplyAdmissionConditions(names []string) {
+	conditions := make([]Condition, 0, len(names))
+	for _, name := range names {
+		conditions = append(conditions, ChatAdmissionCondition(name))
+	}
+	c.SetTemplateConditions(conditions)
+	if len(names) == 0 {
+		c.SetAdmissionPolicy(OwnerApprovalRequired)
+	} else {
+		c.SetAdmissionPolicy(AutomaticWhenConditionsMet)
+	}
+}
+
+func chatAdmissionName(name string) bool {
+	for _, known := range ChatAdmissionConditions {
+		if known == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ChatCell) admission(ctx context.Context, keypath string, requester *Identity) (any, error) {
+	if keypath == "audience.admissionConditions" {
+		if err := c.validate(ctx, "read", "audience", requester); err != nil {
+			return nil, err
+		}
+		return stringsToAny(c.AdmissionConditions()), nil
+	}
+	return c.AdmissionConditionHolds(strings.TrimPrefix(keypath, "audience.admission."), requester), nil
+}
+
+func (c *ChatCell) setAdmissionConditions(ctx context.Context, keypath string, value any, requester *Identity) (any, error) {
+	_, _, _ = ctx, keypath, requester
+	list, ok := NormalizeJSON(value).([]any)
+	if !ok {
+		return fmt.Sprintf("error: admission conditions must be a list of %v", ChatAdmissionConditions), nil
+	}
+	names := []string{}
+	seen := map[string]bool{}
+	for _, item := range list {
+		name, ok := item.(string)
+		if !ok || !chatAdmissionName(name) {
+			return fmt.Sprintf("error: admission conditions must be a list of %v", ChatAdmissionConditions), nil
+		}
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	c.ApplyAdmissionConditions(names)
+	return stringsToAny(names), nil
+}
+
+func stringsToAny(values []string) []any {
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
 }
 
 func (c *ChatCell) isOwnerPerson(p *chatPerson) bool {

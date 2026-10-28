@@ -25,17 +25,20 @@ import (
 const protocol = "haven.interop-peer.v1"
 
 type message struct {
-	Op                string `json:"op"`
-	Name              string `json:"name"`
-	Port              int    `json:"port"`
-	Topic             string `json:"topic"`
-	LandingBase       string `json:"landingBase"`
-	ContactEndpointID string `json:"contactEndpointID"`
-	Cell              string `json:"cell"`
-	Method            string `json:"method"`
-	Key               string `json:"key"`
-	URL               string `json:"url"`
-	Value             any    `json:"value"`
+	Op                string     `json:"op"`
+	Name              string     `json:"name"`
+	Port              int        `json:"port"`
+	Topic             string     `json:"topic"`
+	LandingBase       string     `json:"landingBase"`
+	ContactEndpointID string     `json:"contactEndpointID"`
+	Cell              string     `json:"cell"`
+	Method            string     `json:"method"`
+	Key               string     `json:"key"`
+	URL               string     `json:"url"`
+	Value             any        `json:"value"`
+	Keys              []string   `json:"keys"`
+	ExtraGrants       []cp.Grant `json:"extraGrants"`
+	DropConditions    bool       `json:"dropConditions"`
 }
 
 type peer struct {
@@ -79,9 +82,40 @@ func (p *peer) handle(m message) (any, error) {
 		return map[string]any{"cell": "invitation"}, nil
 	case "serve":
 		return p.serve(m)
-	case "admit":
-		// Swift's owner signs an Agreement here; this ChatCell admits by the verified acceptance.
-		return map[string]any{"admittedBy": "acceptance"}, nil
+	case "agree":
+		// Ask a remote cell for a contract: fetch its Agreement template, keep
+		// the grants named in keys (all when absent), send it back as me.
+		bridge, err := p.bridge(m.URL)
+		if err != nil {
+			return nil, err
+		}
+		described, err := bridge.Advertise(p.ctx, p.me)
+		if err != nil {
+			return nil, err
+		}
+		request := described.ContractTemplate
+		if m.Keys != nil {
+			wanted := map[string]bool{}
+			for _, key := range m.Keys {
+				wanted[key] = true
+			}
+			kept := []cp.Grant{}
+			for _, grant := range request.Grants {
+				if wanted[grant.Keypath] {
+					kept = append(kept, grant)
+				}
+			}
+			request.Grants = kept
+		}
+		request.Grants = append(request.Grants, m.ExtraGrants...)
+		if m.DropConditions {
+			request.Conditions = nil
+		}
+		state, err := bridge.AddAgreement(p.ctx, request, p.me)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"state": string(state)}, nil
 	case "call":
 		cell := p.cells[m.Cell]
 		if cell == nil {
@@ -92,16 +126,11 @@ func (p *peer) handle(m message) (any, error) {
 		}
 		return cell.Set(p.ctx, m.Key, m.Value, p.me)
 	case "remote":
-		bridge := p.bridges[m.URL]
-		if bridge == nil {
-			bridge = cp.NewCloudBridge(m.URL, p.me, cp.CloudBridgeOptions{Authenticate: true, AllowInsecureWebSocket: true, RequestTimeout: 10 * time.Second})
-			if err := bridge.Ready(p.ctx); err != nil {
-				return nil, err
-			}
-			p.bridges[m.URL] = bridge
+		bridge, err := p.bridge(m.URL)
+		if err != nil {
+			return nil, err
 		}
 		var result any
-		var err error
 		if m.Method == "get" {
 			result, err = bridge.Get(p.ctx, m.Key, p.me)
 		} else {
@@ -128,6 +157,18 @@ func (p *peer) handle(m message) (any, error) {
 		return result, nil
 	}
 	return nil, fmt.Errorf("unknown op %s", m.Op)
+}
+
+func (p *peer) bridge(url string) (*cp.CloudBridge, error) {
+	bridge := p.bridges[url]
+	if bridge == nil {
+		bridge = cp.NewCloudBridge(url, p.me, cp.CloudBridgeOptions{Authenticate: true, AllowInsecureWebSocket: true, RequestTimeout: 10 * time.Second})
+		if err := bridge.Ready(p.ctx); err != nil {
+			return nil, err
+		}
+		p.bridges[url] = bridge
+	}
+	return bridge, nil
 }
 
 func (p *peer) serve(m message) (any, error) {
