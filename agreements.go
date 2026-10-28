@@ -7,8 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
-	"time"
 )
 
 type ConnectState string
@@ -247,39 +247,159 @@ func grantKeypathMatches(grant, requested string) bool {
 
 type Evidence map[string]any
 
+// Condition is Swift's TypedCondition. Only "lookup" is evaluated here; any
+// other type fails to decode, so a template or request carrying it is refused.
 type Condition struct {
-	Type             string     `json:"type"`
-	Domain           string     `json:"domain,omitempty"`
-	Purpose          string     `json:"purpose,omitempty"`
-	RequiredEvidence []string   `json:"requiredEvidence,omitempty"`
-	NotBefore        *time.Time `json:"notBefore,omitempty"`
-	ExpiresAt        *time.Time `json:"expiresAt,omitempty"`
+	Lookup *LookupCondition
 }
 
-func (c Condition) Evaluate(ctx context.Context, requester *Identity, purpose string, evidence Evidence) bool {
-	_ = ctx
-	now := time.Now()
-	if c.NotBefore != nil && now.Before(*c.NotBefore) {
+// LookupCondition is Swift's LookupCondition: the value at Keypath, read as
+// the requester, equals ExpectedValue. Keypaths start with "target." (the
+// cell itself) or "identity."; $identity and $target are substituted.
+type LookupCondition struct {
+	UUID          string `json:"uuid"`
+	Name          string `json:"name"`
+	Keypath       string `json:"keypath"`
+	ExpectedValue any    `json:"expectedValue"`
+}
+
+func NewLookupCondition(keypath string, expected any) Condition {
+	return Condition{Lookup: &LookupCondition{UUID: strings.ToUpper(NewUUID()), Name: "Lookup condition", Keypath: keypath, ExpectedValue: expected}}
+}
+
+func (c Condition) MarshalJSON() ([]byte, error) {
+	if c.Lookup == nil {
+		return nil, fmt.Errorf("condition has no supported type")
+	}
+	return json.Marshal(map[string]any{"type": "lookup", "condition": c.Lookup})
+}
+
+func (c *Condition) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type      string          `json:"type"`
+		Condition json.RawMessage `json:"condition"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Type != "lookup" {
+		return fmt.Errorf("unsupported condition type %q", raw.Type)
+	}
+	var lookup struct {
+		UUID          string          `json:"uuid"`
+		Name          string          `json:"name"`
+		Keypath       *string         `json:"keypath"`
+		ExpectedValue json.RawMessage `json:"expectedValue"`
+	}
+	if err := json.Unmarshal(raw.Condition, &lookup); err != nil {
+		return err
+	}
+	if lookup.Keypath == nil || len(lookup.ExpectedValue) == 0 {
+		return fmt.Errorf("lookup condition needs keypath and expectedValue")
+	}
+	var expected any
+	if err := json.Unmarshal(lookup.ExpectedValue, &expected); err != nil {
+		return err
+	}
+	if lookup.Name == "" {
+		lookup.Name = "Lookup condition"
+	}
+	c.Lookup = &LookupCondition{UUID: lookup.UUID, Name: lookup.Name, Keypath: *lookup.Keypath, ExpectedValue: expected}
+	return nil
+}
+
+// policy is what two conditions share to be the same condition (Swift drops only uuid).
+func (c Condition) policy() string {
+	if c.Lookup == nil {
+		return ""
+	}
+	data, _ := json.Marshal(map[string]any{"type": "lookup", "name": c.Lookup.Name, "keypath": c.Lookup.Keypath, "expectedValue": NormalizeJSON(c.Lookup.ExpectedValue)})
+	return string(data)
+}
+
+// Enforcing is Swift's isAuthorizationEnforcingCondition: only lookups on the target or a resolved cell.
+func (c Condition) Enforcing() bool {
+	if c.Lookup == nil {
 		return false
 	}
-	if c.ExpiresAt != nil && now.After(*c.ExpiresAt) {
+	keypath := strings.TrimSpace(c.Lookup.Keypath)
+	return strings.HasPrefix(keypath, "target.") || strings.HasPrefix(keypath, "resolve.")
+}
+
+// Met reads the keypath as the requester and compares it with ExpectedValue.
+func (c Condition) Met(ctx context.Context, target Meddle, requester *Identity) bool {
+	if c.Lookup == nil || requester == nil {
 		return false
 	}
-	if c.Domain != "" && (requester == nil || requester.Domain != c.Domain) {
+	keypath := strings.ReplaceAll(c.Lookup.Keypath, "$identity", requester.UUID)
+	contextKey, child, found := strings.Cut(keypath, ".")
+	if !found || child == "" {
 		return false
 	}
-	if c.Purpose != "" && c.Purpose != purpose {
-		return false
-	}
-	for _, key := range c.RequiredEvidence {
-		if evidence == nil {
+	var value any
+	var err error
+	switch contextKey {
+	case "target":
+		if target == nil {
 			return false
 		}
-		if _, ok := evidence[key]; !ok {
+		value, err = target.Get(withEvaluatingConditions(ctx), child, requester)
+	default:
+		return false
+	}
+	if err != nil {
+		return false
+	}
+	got, _ := json.Marshal(NormalizeJSON(value))
+	want, _ := json.Marshal(NormalizeJSON(c.Lookup.ExpectedValue))
+	return string(got) == string(want)
+}
+
+type evaluatingConditionsKey struct{}
+
+// While conditions are evaluated, contracts give no access, so a condition can
+// never be met by the contract it decides on (as Swift).
+func withEvaluatingConditions(ctx context.Context) context.Context {
+	return context.WithValue(ctx, evaluatingConditionsKey{}, true)
+}
+
+func evaluatingConditions(ctx context.Context) bool {
+	value, _ := ctx.Value(evaluatingConditionsKey{}).(bool)
+	return value
+}
+
+func conditionsMatch(a, b []Condition) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left, right := make([]string, len(a)), make([]string, len(b))
+	for i := range a {
+		left[i], right[i] = a[i].policy(), b[i].policy()
+		if left[i] == "" || right[i] == "" {
+			return false
+		}
+	}
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
 			return false
 		}
 	}
 	return true
+}
+
+// CoversExactly is Swift's Grant.granted: the same keypath, and every requested bit held.
+func (g Grant) CoversExactly(requested Grant) bool {
+	if g.Keypath != requested.Keypath {
+		return false
+	}
+	group, other, ok := permissionBits(g.Permission)
+	wantGroup, wantOther, wantOK := permissionBits(requested.Permission)
+	if !ok || !wantOK || wantGroup == 0 || group&wantGroup != wantGroup {
+		return false
+	}
+	return wantOther == 0 || other&wantOther == wantOther
 }
 
 type Agreement struct {
@@ -323,15 +443,6 @@ func (a Agreement) CheckGrant(requested Grant) bool {
 		}
 	}
 	return false
-}
-
-func (a Agreement) ConditionsSatisfied(ctx context.Context, requester *Identity, purpose string, evidence Evidence) bool {
-	for _, condition := range a.Conditions {
-		if !condition.Evaluate(ctx, requester, purpose, evidence) {
-			return false
-		}
-	}
-	return true
 }
 
 type ConnectContext struct {

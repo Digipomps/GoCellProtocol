@@ -5,10 +5,13 @@ package cellprotocol
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/Digipomps/GoCellProtocol/interop"
 )
 
 type CloudBridgeOptions struct {
@@ -18,6 +21,12 @@ type CloudBridgeOptions struct {
 	Headers                map[string]string
 	AllowInsecureWebSocket bool
 	InsecureSkipVerify     bool
+	// Authenticate runs org.haven.bridge-channel.v1 before any command, as
+	// current Swift bridgeheads require. The identity's vault signs the
+	// challenge. Off only for older peers that still send "ready".
+	Authenticate bool
+	// ChannelDomain is the signed domain; empty means "bridge".
+	ChannelDomain string
 }
 
 func DefaultCloudBridgeOptions() CloudBridgeOptions {
@@ -60,6 +69,7 @@ type CloudBridge struct {
 	signingChallenges *signingChallengeReplayStore
 
 	cachedDescription *AnyCell
+	admittedChannel   *interop.AdmittedChannel
 }
 
 func NewCloudBridge(endpoint string, identity *Identity, options CloudBridgeOptions) *CloudBridge {
@@ -130,6 +140,15 @@ func (b *CloudBridge) Connect(ctx context.Context) error {
 		AllowInsecureWebSocket: b.options.AllowInsecureWebSocket,
 	})
 
+	var admitted *interop.AdmittedChannel
+	if err == nil && b.options.Authenticate {
+		admitted, err = b.authenticateChannel(ctx, socket)
+		if err != nil {
+			_ = socket.Close()
+			err = fmt.Errorf("bridge channel authentication failed: %w", err)
+		}
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.connecting = false
@@ -141,8 +160,82 @@ func (b *CloudBridge) Connect(ctx context.Context) error {
 	b.connected = true
 	b.sessionReady = false
 	b.readErr = nil
+	if admitted != nil {
+		// An admitted channel never sends "ready": admission is the ready signal.
+		b.admittedChannel = admitted
+		b.sessionReady = true
+		close(b.ready)
+	}
 	go b.readLoop()
 	return nil
+}
+
+// AdmittedChannel is the proven channel after an authenticated Connect.
+func (b *CloudBridge) AdmittedChannel() *interop.AdmittedChannel {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.admittedChannel
+}
+
+// authenticateChannel is the client half of org.haven.bridge-channel.v1,
+// signed by the local identity's vault.
+func (b *CloudBridge) authenticateChannel(ctx context.Context, socket *webSocketClient) (*interop.AdmittedChannel, error) {
+	identity := b.identity
+	if identity == nil || identity.PublicSecureKey == "" || identity.Vault() == nil {
+		return nil, fmt.Errorf("needs a local signing identity with a vault")
+	}
+	key, err := base64.StdEncoding.DecodeString(identity.PublicSecureKey)
+	if err != nil {
+		return nil, fmt.Errorf("unreadable public key")
+	}
+	domain := b.options.ChannelDomain
+	if domain == "" {
+		domain = "bridge"
+	}
+	endpoint, err := interop.ChannelEndpointFromURL(b.endpoint, domain, b.options.AllowInsecureWebSocket)
+	if err != nil {
+		return nil, err
+	}
+	client, err := interop.NewChannelClient(interop.NewEd25519PublicIdentity(identity.UUID, key), endpoint, interop.ChannelClock{})
+	if err != nil {
+		return nil, err
+	}
+	_ = socket.conn.SetDeadline(time.Now().Add(interop.ChannelPreAuthDeadline))
+	defer socket.conn.SetDeadline(time.Time{})
+	hello, err := client.Hello()
+	if err != nil {
+		return nil, err
+	}
+	if err := socket.SendText(ctx, hello); err != nil {
+		return nil, err
+	}
+	challenge, err := socket.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+	offered, err := client.BeginChallenge(challenge)
+	if err != nil {
+		return nil, err
+	}
+	signature, err := identity.Sign(ctx, offered)
+	if err != nil {
+		return nil, err
+	}
+	proof, err := client.FinishChallenge(signature)
+	if err != nil {
+		return nil, err
+	}
+	if err := socket.SendText(ctx, proof); err != nil {
+		return nil, err
+	}
+	accepted, err := socket.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Accept(accepted); err != nil {
+		return nil, err
+	}
+	return client.Admitted, nil
 }
 
 func (b *CloudBridge) Ready(ctx context.Context) error {

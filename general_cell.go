@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type CellUsageScope string
@@ -69,7 +70,32 @@ type GeneralCell struct {
 	nextSubscriber    int
 	nextSequence      uint64
 	agreements        map[string]Agreement
+	admissionPolicy   string
+	contracts         []Contract
+	revokedBefore     map[string]time.Time
+	conditionTarget   Meddle
 	closed            bool
+}
+
+const (
+	DefaultAgreementDuration = 60 * 60 * 24 * 365
+	// MaximumAgreementDuration is Swift's Contract.maximumDuration.
+	MaximumAgreementDuration = 60 * 60 * 24 * 365
+
+	OwnerApprovalRequired      = "ownerApprovalRequired"
+	AutomaticWhenConditionsMet = "automaticWhenConditionsMet"
+	OwnerPublishedRead         = "ownerPublishedRead"
+)
+
+// Contract is one the cell signed for a subject. The cell keeps it; every
+// access re-checks it against the current template and its conditions.
+type Contract struct {
+	UUID       string
+	Subject    *Identity
+	Grants     []Grant
+	Conditions []Condition
+	Duration   int
+	IssuedAt   time.Time
 }
 
 func NewGeneralCell(owner *Identity, name string) *GeneralCell {
@@ -90,6 +116,8 @@ func NewGeneralCell(owner *Identity, name string) *GeneralCell {
 		subscribers:       map[int]chan FlowElement{},
 		agreements:        map[string]Agreement{},
 		agreementTemplate: AgreementTemplate{},
+		admissionPolicy:   OwnerApprovalRequired,
+		revokedBefore:     map[string]time.Time{},
 	}
 	cell.agreementTemplate.AddGrant("r--", "description")
 	cell.agreementTemplate.AddGrant("r--", "keys")
@@ -128,6 +156,26 @@ func (c *GeneralCell) SetIdentityDomain(domain string) {
 
 func (c *GeneralCell) AgreementTemplate() *AgreementTemplate {
 	return &c.agreementTemplate
+}
+
+// TemplateConditions are the Agreement template's conditions.
+func (c *GeneralCell) TemplateConditions() []Condition {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]Condition(nil), c.agreementTemplate.Conditions...)
+}
+
+// SetTemplateConditions replaces the Agreement template's conditions.
+func (c *GeneralCell) SetTemplateConditions(conditions []Condition) {
+	c.mu.Lock()
+	c.agreementTemplate.Conditions = append([]Condition(nil), conditions...)
+	c.mu.Unlock()
+}
+
+func (c *GeneralCell) ownerIdentity() *Identity {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.owner
 }
 
 func (c *GeneralCell) AddGetHandler(key string, handler GetHandler) {
@@ -385,17 +433,11 @@ func (c *GeneralCell) Admit(ctx context.Context, connect ConnectContext) (Connec
 	if requester == nil {
 		return ConnectDenied, nil
 	}
-	c.mu.RLock()
-	agreement, ok := c.agreements[identityReferenceKey(requester)]
-	c.mu.RUnlock()
-	if !ok {
+	if !c.HoldsContract(ctx, requester) {
 		return ConnectSignContract, nil
 	}
-	if !agreement.ConditionsSatisfied(ctx, requester, connect.Purpose, connect.Evidence) {
-		return ConnectDenied, nil
-	}
 	for _, capability := range connect.RequestedCapabilities {
-		if !agreement.CheckGrant(Grant{Keypath: capabilityKeypath(capability), Permission: capability}) {
+		if !c.ContractAllows(ctx, "-w--", capabilityKeypath(capability), requester) && !c.ContractAllows(ctx, "r---", capabilityKeypath(capability), requester) {
 			return ConnectDenied, nil
 		}
 	}
@@ -417,16 +459,195 @@ func (c *GeneralCell) Close(ctx context.Context, requester *Identity) error {
 }
 
 func (c *GeneralCell) AddAgreement(ctx context.Context, contract Agreement, identity *Identity) (AgreementState, error) {
-	_ = ctx
-	_ = contract
-	if identity == nil {
-		return AgreementRejected, fmt.Errorf("identity is nil")
+	return c.AddAgreementAuthorizedBy(ctx, contract, identity, nil)
+}
+
+// SetAdmissionPolicy is Swift's agreementAdmissionPolicy.
+func (c *GeneralCell) SetAdmissionPolicy(policy string) {
+	c.mu.Lock()
+	c.admissionPolicy = policy
+	c.mu.Unlock()
+}
+
+func (c *GeneralCell) AdmissionPolicy() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.admissionPolicy
+}
+
+// SetConditionTarget names the cell conditions read "target." from: the
+// outer cell when GeneralCell is embedded.
+func (c *GeneralCell) SetConditionTarget(target Meddle) {
+	c.mu.Lock()
+	c.conditionTarget = target
+	c.mu.Unlock()
+}
+
+func (c *GeneralCell) target() Meddle {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.conditionTarget != nil {
+		return c.conditionTarget
 	}
-	// GoCellProtocol does not yet have the Swift runtime's signed Contract and
-	// owner-proof admission path. Installing a caller-supplied Agreement here
-	// would let its subject mint arbitrary grants, so admission remains closed
-	// until that proof-bearing model is ported and fixture-tested.
-	return AgreementRejected, nil
+	return c
+}
+
+// AddAgreementAuthorizedBy is Swift's addAgreement(_:for:authorizedBy:): sign a
+// contract for identity, or reject. The request must stay inside the template
+// (same owner, granted keypaths only, the template's conditions, no longer
+// duration). The owner approves it, or the policy is automaticWhenConditionsMet
+// and the template has an enforcing condition. Then every condition must hold.
+func (c *GeneralCell) AddAgreementAuthorizedBy(ctx context.Context, request Agreement, identity, authority *Identity) (AgreementState, error) {
+	c.mu.RLock()
+	owner := c.owner
+	template := c.agreementTemplate
+	policy := c.admissionPolicy
+	cellUUID, domain := c.uuid, c.identityDomain
+	c.mu.RUnlock()
+	if identity == nil || owner == nil {
+		return AgreementRejected, nil
+	}
+	if identity.Vault() != nil && !identityProvesSigningKeyControl(ctx, identity, identity, domain, "cell:///"+cellUUID+"/agreement", "addAgreement", "GoCellProtocol.GeneralCell") {
+		return AgreementRejected, nil
+	}
+	ownerAuthorized := authority != nil && identitiesReferenceSameSigningKey(owner, authority) &&
+		identityProvesSigningKeyControl(ctx, owner, authority, domain, "cell:///"+cellUUID+"/agreement", "addAgreement", "GoCellProtocol.GeneralCell")
+	if request.Owner == nil || !identitiesReferenceSameSigningKey(owner, request.Owner) ||
+		request.State != AgreementStateTemplate || request.Duration <= 0 ||
+		request.Duration > template.duration() || request.Duration > MaximumAgreementDuration ||
+		len(request.Grants) == 0 || !conditionsMatch(request.Conditions, template.Conditions) {
+		return AgreementRejected, nil
+	}
+	for _, grant := range request.Grants {
+		if !template.CheckGrant(grant) {
+			return AgreementRejected, nil
+		}
+	}
+	if !ownerAuthorized {
+		switch policy {
+		case AutomaticWhenConditionsMet:
+			enforcing := false
+			for _, condition := range template.Conditions {
+				enforcing = enforcing || condition.Enforcing()
+			}
+			if !enforcing {
+				return AgreementRejected, nil
+			}
+		case OwnerPublishedRead:
+			for _, grant := range request.Grants {
+				if group, other, ok := permissionBits(grant.Permission); !ok || group != 4 || other != 0 {
+					return AgreementRejected, nil
+				}
+			}
+		default:
+			return AgreementRejected, nil
+		}
+	}
+	if !c.conditionsHold(ctx, template.Conditions, identity) {
+		return AgreementRejected, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	issuedAt := time.Now()
+	if cutoff, ok := c.revokedBefore[identity.UUID]; ok && !issuedAt.After(cutoff) {
+		issuedAt = cutoff.Add(time.Microsecond)
+	}
+	c.contracts = append(c.contracts, Contract{
+		UUID:       strings.ToUpper(NewUUID()),
+		Subject:    identity,
+		Grants:     append([]Grant(nil), request.Grants...),
+		Conditions: append([]Condition(nil), template.Conditions...),
+		Duration:   request.Duration,
+		IssuedAt:   issuedAt,
+	})
+	return AgreementSigned, nil
+}
+
+func (c *GeneralCell) conditionsHold(ctx context.Context, conditions []Condition, identity *Identity) bool {
+	target := c.target()
+	ctx = withEvaluatingConditions(ctx)
+	for _, condition := range conditions {
+		if !condition.Met(ctx, target, identity) {
+			return false
+		}
+	}
+	return true
+}
+
+// ContractAllows is true when a current contract of requester grants
+// permission ("r---", "-w--") at exactly keypath. As Swift, the contract must
+// still match the template and its conditions must still hold.
+func (c *GeneralCell) ContractAllows(ctx context.Context, permission, keypath string, requester *Identity) bool {
+	if requester == nil || evaluatingConditions(ctx) {
+		return false
+	}
+	requested := Grant{Keypath: keypath, Permission: permission}
+	for _, contract := range c.currentContracts(requester) {
+		covered := false
+		for _, grant := range contract.Grants {
+			covered = covered || grant.CoversExactly(requested)
+		}
+		if covered && c.conditionsHold(ctx, contract.Conditions, requester) {
+			return true
+		}
+	}
+	return false
+}
+
+// HoldsContract is true when requester has any current contract whose conditions hold.
+func (c *GeneralCell) HoldsContract(ctx context.Context, requester *Identity) bool {
+	if requester == nil || evaluatingConditions(ctx) {
+		return false
+	}
+	for _, contract := range c.currentContracts(requester) {
+		if c.conditionsHold(ctx, contract.Conditions, requester) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *GeneralCell) currentContracts(requester *Identity) []Contract {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	now := time.Now()
+	var out []Contract
+	for _, contract := range c.contracts {
+		if !identitiesReferenceSameSigningKey(contract.Subject, requester) {
+			continue
+		}
+		if cutoff, ok := c.revokedBefore[contract.Subject.UUID]; ok && !contract.IssuedAt.After(cutoff) {
+			continue
+		}
+		if now.Before(contract.IssuedAt) || !now.Before(contract.IssuedAt.Add(time.Duration(contract.Duration)*time.Second)) {
+			continue
+		}
+		if contract.Duration > c.agreementTemplate.duration() || !conditionsMatch(contract.Conditions, c.agreementTemplate.Conditions) {
+			continue
+		}
+		inside := true
+		for _, grant := range contract.Grants {
+			inside = inside && c.agreementTemplate.CheckGrant(grant)
+		}
+		if inside {
+			out = append(out, contract)
+		}
+	}
+	return out
+}
+
+// RemoveContracts is Swift's removeMember: contracts issued up to now stop counting.
+func (c *GeneralCell) RemoveContracts(subjectUUID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.revokedBefore[subjectUUID] = time.Now()
+	kept := c.contracts[:0]
+	for _, contract := range c.contracts {
+		if contract.Subject.UUID != subjectUUID {
+			kept = append(kept, contract)
+		}
+	}
+	c.contracts = kept
 }
 
 func (c *GeneralCell) Advertise(ctx context.Context, requester *Identity) (AnyCell, error) {
@@ -442,6 +663,8 @@ func (c *GeneralCell) Advertise(ctx context.Context, requester *Identity) (AnyCe
 	}
 	contract := NewAgreement(owner)
 	contract.Grants = append([]Grant(nil), c.agreementTemplate.Grants...)
+	contract.Conditions = append([]Condition(nil), c.agreementTemplate.Conditions...)
+	contract.Duration = c.agreementTemplate.duration()
 	return AnyCell{
 		UUID:              c.uuid,
 		Name:              c.name,
@@ -553,11 +776,6 @@ func (c *GeneralCell) FlowHistory() []FlowElement {
 func (c *GeneralCell) ValidateAccess(ctx context.Context, operation, keypath string, requester *Identity) error {
 	c.mu.RLock()
 	owner := c.owner
-	agreement := Agreement{}
-	hasAgreement := false
-	if requester != nil {
-		agreement, hasAgreement = c.agreements[identityReferenceKey(requester)]
-	}
 	cellUUID := c.uuid
 	identityDomain := c.identityDomain
 	c.mu.RUnlock()
@@ -581,17 +799,20 @@ func (c *GeneralCell) ValidateAccess(ctx context.Context, operation, keypath str
 		}
 		return fmt.Errorf("access denied: owner signing-key proof failed")
 	}
-	if !hasAgreement {
-		return fmt.Errorf("access denied: no contract for %s", identityLabel(requester))
-	}
-	if !agreement.ConditionsSatisfied(ctx, requester, "", nil) {
-		return fmt.Errorf("access denied: contract conditions failed")
-	}
-	requested := Grant{Keypath: keypath, Permission: permissionForOperation(operation, keypath)}
-	if agreement.CheckGrant(requested) {
+	if c.ContractAllows(ctx, swiftPermission(operation), keypath, requester) {
 		return nil
 	}
-	return fmt.Errorf("access denied: missing capability %s on %s", requested.Permission, keypath)
+	return fmt.Errorf("access denied: no contract for %s grants %s on %s", identityLabel(requester), swiftPermission(operation), keypath)
+}
+
+// swiftPermission maps an operation to the Swift permission a grant must hold.
+func swiftPermission(operation string) string {
+	switch operation {
+	case "read", "flow.read":
+		return "r---"
+	default:
+		return "-w--"
+	}
 }
 
 func (c *GeneralCell) handlerForGet(keypath string) GetHandler {
