@@ -72,6 +72,10 @@ func loadFixtures(t *testing.T) (fixtureManifest, map[string]fixtureCase) {
 		if err := json.Unmarshal(data, &c); err != nil {
 			t.Fatal(err)
 		}
+		if entry.Flow == "org" {
+			// Organization cases are checked in organization_test.go.
+			continue
+		}
 		if ownTestTypes[c.Type] {
 			// Handshake vectors and the VC chain have their own tests
 			// (channel_test.go, identity_link_test.go).
