@@ -23,6 +23,11 @@ package cellprotocol
 // recognised by its signing key, which the authenticated bridge checks on
 // every command.
 //
+// A language model can be a named participant (model.*, see chat_model.go):
+// it is admitted under the same member / invitationAccepted condition, which
+// for the model identity holds only while every human member has said yes,
+// and it may use only its own keys and read only for an open ask.
+//
 // Not ported: end-to-end encrypted envelopes (crypto.* says plaintext only),
 // rekey tracking, the invitation ledger history and the demo emitter.
 
@@ -74,7 +79,15 @@ var (
 		{"rw--", "crypto.prepareDraftEnvelope"}, {"rw--", "crypto.openEnvelope"}, {"rw--", "crypto.clearDraftEnvelope"},
 		{"rw--", "crypto.clearEncryptedMessages"}, {"rw--", "sendMessage"}, {"rw--", "sendComposedMessage"},
 		{"rw--", "clearComposer"}, {"rw--", "addMessage"}, {"rw--", "start"}, {"rw--", "stop"},
+		// The model participant (PDD_modell-i-felles-chat_2026-11-15), as Swift.
+		{"rw--", "model.state"}, {"rw--", "model.propose"}, {"rw--", "model.consent"}, {"rw--", "model.decline"},
+		{"rw--", "model.remove"}, {"rw--", "model.ask"}, {"rw--", "model.dismissNotice"},
+		{"rw--", "model.context"}, {"rw--", "model.answer"}, {"rw--", "model.fail"},
 	}
+	// ChatModelMemberKeys are what a human member uses; ChatModelParticipantKeys
+	// are the only keys the admitted model identity may use.
+	ChatModelMemberKeys      = []string{"model.state", "model.propose", "model.consent", "model.decline", "model.remove", "model.ask", "model.dismissNotice"}
+	ChatModelParticipantKeys = []string{"model.state", "model.context", "model.answer", "model.fail"}
 	// ChatAdmissionConditions are the conditions an owner can put in the
 	// Agreement. Each reads audience.admission.<name> on the chat.
 	ChatAdmissionConditions = []string{"invitationAccepted", "member"}
@@ -83,6 +96,7 @@ var (
 	// the invitee's signatures.
 	chatOpenBeforeAdmission = map[string]string{
 		"audience.admission.invitationAccepted": "r---", "audience.admission.member": "r---",
+		chatModelConsentKey:                 "r---",
 		"audience.acceptInvitationArtifact": "-w--", "audience.inspectInvitationArtifact": "-w--",
 	}
 	chatAudienceMod = map[string][2]string{
@@ -92,6 +106,8 @@ var (
 	}
 	chatStatusLabels = map[string]string{"pending": "Pending", "accepted": "Accepted", "declined": "Declined", "revoked": "Revoked"}
 )
+
+const chatModelConsentKey = "audience.admission.modelConsent"
 
 func chatFormats() []any {
 	return []any{
@@ -188,6 +204,12 @@ type ChatCell struct {
 	invitations  map[string]*chatInvitation
 	consumed     map[string]map[string]any
 	drafts       map[string]map[string]string
+	modelLedger  *ChatModelConsentLedger
+	modelPerson  *chatPerson
+	modelAsks    map[string]*chatModelAsk
+	modelNotices map[string]map[string]any // asker uuid -> notice
+	// modelOwnerNotMember: a node hosts the chat; the owner neither counts nor answers for the model.
+	modelOwnerNotMember bool
 }
 
 func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
@@ -217,6 +239,9 @@ func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
 		invitations:  map[string]*chatInvitation{},
 		consumed:     map[string]map[string]any{},
 		drafts:       map[string]map[string]string{},
+		modelLedger:  NewChatModelConsentLedger(),
+		modelAsks:    map[string]*chatModelAsk{},
+		modelNotices: map[string]map[string]any{},
 	}
 	if owner != nil {
 		cell.ownerPerson = chatPersonFromIdentity(owner)
@@ -235,6 +260,16 @@ func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
 	}
 	cell.AddGetHandler("audience.admissionConditions", cell.admission)
 	cell.AddSetHandler("audience.admissionConditions", cell.setAdmissionConditions)
+	cell.AddGetHandler(chatModelConsentKey, cell.modelConsent)
+	cell.AddGetHandler("model.state", cell.modelGet)
+	cell.AddSetHandler("model.ownerIsMember", cell.setModelOwnerIsMember)
+	cell.AddSetHandler("history.limit", cell.setHistoryLimit)
+	cell.AddSetHandler("history.import", cell.setHistoryImport)
+	for _, key := range append(append([]string{}, ChatModelMemberKeys...), ChatModelParticipantKeys...) {
+		if key != "model.state" {
+			cell.AddSetHandler(key, cell.modelSet)
+		}
+	}
 	cell.SetConditionTarget(cell)
 	return cell
 }
@@ -267,6 +302,12 @@ func (c *ChatCell) validate(ctx context.Context, operation, keypath string, requ
 		return nil
 	}
 	denied := fmt.Errorf("access denied: no contract for %s grants %s on %s", identityLabel(requester), permission, keypath)
+	c.stateMu.Lock()
+	isModel := c.isModel(requester)
+	c.stateMu.Unlock()
+	if isModel && !containsString(ChatModelParticipantKeys, keypath) {
+		return denied // the model uses only its own keys
+	}
 	if keypath == "audience.admissionConditions" && permission == "-w--" {
 		return denied // the owner's alone, whatever "audience" grants say
 	}
@@ -308,6 +349,11 @@ func (c *ChatCell) Set(ctx context.Context, keypath string, value any, requester
 func (c *ChatCell) AdmissionConditionHolds(name string, requester *Identity) bool {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
+	if c.isModel(requester) {
+		// The model is admitted by the members' consent, under whichever
+		// condition the chat uses (FORMAALSSPEC: modelConsent).
+		return c.modelConsentHolds()
+	}
 	member := c.memberFor(requester)
 	if member == nil {
 		return false
@@ -475,6 +521,9 @@ func (c *ChatCell) write(ctx context.Context, keypath string, value any, request
 	value = NormalizeJSON(value)
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
+	if strings.HasPrefix(keypath, "audience.") {
+		defer c.modelMembersChanged()
+	}
 	switch keypath {
 	case "audience.mode":
 		mode := extString(value)
@@ -581,6 +630,9 @@ func (c *ChatCell) personFor(requester *Identity) *chatPerson {
 	if requester != nil && c.ownerPerson != nil && requester.UUID == c.ownerPerson.uuid {
 		return c.ownerPerson
 	}
+	if c.isModel(requester) {
+		return c.modelPerson
+	}
 	if member := c.memberFor(requester); member != nil {
 		return member
 	}
@@ -611,10 +663,18 @@ func (c *ChatCell) sendMessage(value any, requester *Identity) any {
 }
 
 func (c *ChatCell) store(body, contentType, topic string, requester *Identity) map[string]any {
+	return c.storeMessage(body, contentType, topic, requester, nil)
+}
+
+// storeMessage stores a message; modelFields marks it as the model's answer.
+func (c *ChatCell) storeMessage(body, contentType, topic string, requester *Identity, modelFields map[string]any) map[string]any {
 	person := c.personFor(requester)
 	name := person.displayName
 	if requester != nil && requester.DisplayName != "" {
 		name = requester.DisplayName
+	}
+	if modelFields != nil && c.modelLedger.ModelDisplayName != "" {
+		name = c.modelLedger.ModelDisplayName
 	}
 	preview := body
 	if runes := []rune(body); len(runes) > 140 {
@@ -628,7 +688,13 @@ func (c *ChatCell) store(body, contentType, topic string, requester *Identity) m
 		"id": c.opts.NewUUID(), "owner": person.publicJSON(), "ownerUUID": person.uuid, "ownerDisplayName": name,
 		"ownerInitials": chatInitials(name), "content": body, "contentPreview": preview, "contentType": contentType,
 		"formatLabel": label, "isMarkdown": contentType == "text/markdown", "topic": topic, "createdAt": c.now(),
-		"cryptoState": "plaintextOnly", "encryptedCompanionAvailable": false,
+		"cryptoState": "plaintextOnly", "encryptedCompanionAvailable": false, "authorKind": "person",
+	}
+	for key, value := range modelFields {
+		message[key] = value
+	}
+	if modelFields != nil {
+		message["authorKind"] = "model"
 	}
 	c.messages = append(c.messages, message)
 	if over := len(c.messages) - c.opts.MessagesLimit; over > 0 {
@@ -1150,8 +1216,17 @@ func (c *ChatCell) messageList() []any {
 
 func (c *ChatCell) participantRows() []any {
 	rows := []map[string]any{}
+	modelUUID := ""
+	if c.modelPerson != nil {
+		modelUUID = c.modelPerson.uuid
+	}
 	for _, row := range c.participants {
-		rows = append(rows, copyMap(row))
+		out := copyMap(row)
+		out["kind"] = "person"
+		if extString(row["id"]) == modelUUID {
+			out["kind"] = "model"
+		}
+		rows = append(rows, out)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		return strings.ToLower(extString(rows[i]["displayName"])) < strings.ToLower(extString(rows[j]["displayName"]))
