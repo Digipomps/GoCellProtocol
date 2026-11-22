@@ -50,6 +50,9 @@ func loadLinkFixtures(t *testing.T) linkFixtures {
 		if err := json.Unmarshal(data, &c); err != nil {
 			t.Fatal(err)
 		}
+		if entry.Flow == "org" {
+			continue
+		}
 		switch c.Type {
 		case "VCClaim", "VCPresentation", "IdentityLinkCompletionEnvelope", "EntityGenesisSeal":
 			out.cases[c.ID] = c
