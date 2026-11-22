@@ -263,6 +263,8 @@ func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
 	cell.AddGetHandler(chatModelConsentKey, cell.modelConsent)
 	cell.AddGetHandler("model.state", cell.modelGet)
 	cell.AddSetHandler("model.ownerIsMember", cell.setModelOwnerIsMember)
+	cell.AddSetHandler("history.limit", cell.setHistoryLimit)
+	cell.AddSetHandler("history.import", cell.setHistoryImport)
 	for _, key := range append(append([]string{}, ChatModelMemberKeys...), ChatModelParticipantKeys...) {
 		if key != "model.state" {
 			cell.AddSetHandler(key, cell.modelSet)
