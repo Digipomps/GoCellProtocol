@@ -208,6 +208,8 @@ type ChatCell struct {
 	modelPerson  *chatPerson
 	modelAsks    map[string]*chatModelAsk
 	modelNotices map[string]map[string]any // asker uuid -> notice
+	// modelOwnerNotMember: a node hosts the chat; the owner neither counts nor answers for the model.
+	modelOwnerNotMember bool
 }
 
 func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
@@ -260,6 +262,7 @@ func NewChatCell(owner *Identity, opts ChatCellOptions) *ChatCell {
 	cell.AddSetHandler("audience.admissionConditions", cell.setAdmissionConditions)
 	cell.AddGetHandler(chatModelConsentKey, cell.modelConsent)
 	cell.AddGetHandler("model.state", cell.modelGet)
+	cell.AddSetHandler("model.ownerIsMember", cell.setModelOwnerIsMember)
 	for _, key := range append(append([]string{}, ChatModelMemberKeys...), ChatModelParticipantKeys...) {
 		if key != "model.state" {
 			cell.AddSetHandler(key, cell.modelSet)

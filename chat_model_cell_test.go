@@ -293,3 +293,29 @@ func TestChatModelStrangersAndImpostorsStayOut(t *testing.T) {
 		t.Fatalf("member posed as model: %v", got)
 	}
 }
+
+func TestChatModelNodeHostedChatCountsOnlyItsPeople(t *testing.T) {
+	m := newModelChat(t, true)
+	ctx := context.Background()
+	if got := obj(t, chatSet(t, m.chat, "model.ownerIsMember", false, m.alice)); got["ownerIsMember"] != false {
+		t.Fatalf("got %#v", got)
+	}
+	if _, err := m.chat.Set(ctx, "model.ownerIsMember", true, m.bob); err == nil {
+		t.Fatal("member changed hosting")
+	}
+	chatSet(t, m.chat, "model.propose", map[string]any{"identity": identityWire(t, m.model), "displayName": "Qwen"}, m.bob)
+	state := obj(t, obj(t, chatSet(t, m.chat, "model.consent", map[string]any{}, m.carol))["model"])
+	if state["isActive"] != true || state["memberCount"] != 2 {
+		t.Fatalf("state %#v", state)
+	}
+	if got := chatSet(t, m.chat, "model.decline", nil, m.alice); got != "denied" {
+		t.Fatalf("node answered for people: %v", got)
+	}
+	if m.modelRequest(t) != AgreementSigned {
+		t.Fatal("model not admitted")
+	}
+	chatSet(t, m.chat, "model.remove", nil, m.bob)
+	if code := obj(t, chatSet(t, m.chat, "model.propose", map[string]any{"identity": identityWire(t, m.alice)}, m.bob))["code"]; code != "invalid_model" {
+		t.Fatalf("code %v", code)
+	}
+}

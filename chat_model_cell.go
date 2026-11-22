@@ -41,7 +41,7 @@ func (c *ChatCell) isModel(requester *Identity) bool {
 // humanMemberUUIDs are the owner and everyone with an accepted invitation, the model left out.
 func (c *ChatCell) humanMemberUUIDs() []string {
 	seen := map[string]bool{}
-	if owner := c.ownerIdentity(); owner != nil {
+	if owner := c.ownerIdentity(); owner != nil && !c.modelOwnerNotMember {
 		seen[owner.UUID] = true
 	}
 	for uuid, record := range c.invitations {
@@ -62,7 +62,7 @@ func (c *ChatCell) isHumanMember(requester *Identity) bool {
 		return false
 	}
 	if c.ownerPerson != nil && c.ownerPerson.matches(requester) {
-		return true
+		return !c.modelOwnerNotMember
 	}
 	return c.memberFor(requester) != nil
 }
@@ -165,6 +165,7 @@ func (c *ChatCell) modelState(requester *Identity) map[string]any {
 		"myConsent":              nil,
 		"contextLimit":           ChatModelContextLimit,
 		"notice":                 nil,
+		"ownerIsMember":          !c.modelOwnerNotMember,
 	}
 	if ledger.ProposedByUUID != "" {
 		state["proposedByName"] = c.displayNameFor(ledger.ProposedByUUID)
@@ -250,7 +251,7 @@ func (c *ChatCell) modelSet(ctx context.Context, keypath string, value any, requ
 		if model == nil || model.descriptor == nil {
 			return chatModelRefusal("invalid_payload", "model.propose needs {identity}"), nil
 		}
-		if model.uuid == by || containsString(members, model.uuid) {
+		if model.uuid == by || containsString(members, model.uuid) || (c.ownerPerson != nil && model.uuid == c.ownerPerson.uuid) {
 			return chatModelRefusal("invalid_model", "A member cannot be the model participant."), nil
 		}
 		name := extString(payload["displayName"])
@@ -399,4 +400,22 @@ func (c *ChatCell) modelFail(payload map[string]any) any {
 	}
 	c.notice(ask, code, SanitizeChatModelAnswer(message))
 	return map[string]any{"status": "ok", "askID": ask.id}
+}
+
+// setModelOwnerIsMember is owner only (the dispatcher admits only the owner,
+// since no template grant covers it). False for a node-hosted chat.
+func (c *ChatCell) setModelOwnerIsMember(ctx context.Context, keypath string, value any, requester *Identity) (any, error) {
+	_, _ = ctx, keypath
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.ownerPerson == nil || !c.ownerPerson.matches(requester) {
+		return "denied", nil
+	}
+	flag, ok := NormalizeJSON(value).(bool)
+	if !ok {
+		return chatModelRefusal("invalid_payload", "model.ownerIsMember needs a bool"), nil
+	}
+	c.modelOwnerNotMember = !flag
+	c.modelMembersChanged()
+	return map[string]any{"status": "ok", "ownerIsMember": flag}, nil
 }
