@@ -97,15 +97,20 @@ func TestExtensionRequestHashAndHumanCodeMatchSwift(t *testing.T) {
 		t.Fatal(err)
 	}
 	related := c["related"].(map[string]any)
-	hash, err := BindingRequestHash(&request)
+	hash, err := ExtensionRequestHash(&request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := base64.StdEncoding.EncodeToString(hash); got != related["bindingRequestHashBase64"] {
-		t.Fatalf("binding hash = %s, Swift %s", got, related["bindingRequestHashBase64"])
+	if got := base64.StdEncoding.EncodeToString(hash); got != related["requestHashBase64"] {
+		t.Fatalf("request hash = %s, Swift %s", got, related["requestHashBase64"])
 	}
-	if got := HumanCode(request.RequestID + request.Audience); got != related["humanCode"] {
+	if got := ExtensionHumanCode(&request); got != related["humanCode"] {
 		t.Fatalf("human code = %s, Swift %s", got, related["humanCode"])
+	}
+	widened := request
+	widened.RequestedScopes = append(append([]string{}, request.RequestedScopes...), "admin")
+	if ExtensionHumanCode(&widened) == ExtensionHumanCode(&request) {
+		t.Fatal("same requestID and audience must not give the same code when the content differs")
 	}
 }
 
@@ -153,7 +158,7 @@ func TestExtensionAskApproveAcceptBetweenTwoGoPlaces(t *testing.T) {
 	if err := interop.VerifyEnrollmentApproval(&approval, f.descriptors["alice"], nil); err != nil {
 		t.Fatal(err)
 	}
-	acceptedAny, _ := newPlace.Set(ctx, "extension.acceptApproval", map[string]any{"payload": approved["payload"], "issuerIdentity": approved["issuerIdentity"]}, owner)
+	acceptedAny, _ := newPlace.Set(ctx, "extension.acceptApproval", map[string]any{"package": approved["package"]}, owner)
 	accepted := acceptedAny.(map[string]any)
 	if accepted["status"] != "ok" || accepted["signatureVerified"] != true {
 		t.Fatalf("accepted = %#v", accepted)
@@ -192,8 +197,15 @@ func TestExtensionAcceptRefusesForeignTamperedAndExpired(t *testing.T) {
 	if got := newPlace.acceptApproval(map[string]any{"approval": wire, "issuerIdentity": approved["issuerIdentity"]}); got["code"] != "bad_signature" {
 		t.Fatalf("tampered = %#v", got)
 	}
-	if got := newPlace.acceptApproval(approved["payload"]); got["status"] != "ok" || got["signatureVerified"] != false {
+	if got := newPlace.acceptApproval(approved["payload"]); got["code"] != "missing_issuer_key" {
 		t.Fatalf("plain = %#v", got)
+	}
+	forged := newExtensionCell(f, "mallory", f.verifyAt).approveRequest(asked["payload"])
+	if got := newPlace.acceptApproval(map[string]any{"payload": forged["payload"], "issuerIdentity": approved["issuerIdentity"]}); got["code"] != "bad_signature" {
+		t.Fatalf("forged = %#v", got)
+	}
+	if got := newPlace.acceptApproval(map[string]any{"package": approved["package"]}); got["status"] != "ok" || got["signatureVerified"] != true {
+		t.Fatalf("package = %#v", got)
 	}
 
 	late := newExtensionCell(f, "bob", f.verifyAt)

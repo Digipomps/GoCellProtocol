@@ -13,11 +13,12 @@ package cellprotocol
 //
 // Transport packets are base64url of the model's JSON, as Binding sends them.
 //
-// The request hash is Binding's: the UTF-8 of the hex SHA-256 of the base64 of
-// the canonical request. EntityAnchorCell and the VC completion chain in
-// CellBase use the raw SHA-256 instead, so an approval from this flow does not
-// complete on an EntityAnchor. That mismatch is in Swift; it is kept here so
-// Binding accepts what Go approves.
+// The request hash is SHA-256 of the canonical request, as in CellBase
+// (IdentityLinkProtocolService.requestHash) and EntityAnchorCell. The human code
+// both screens show is derived from that hash, so a request with another key or
+// other scopes shows another code. extension.approveRequest returns a `package`
+// with the approval and the approver's public key, and extension.acceptApproval
+// links only when that signature verifies.
 
 import (
 	"context"
@@ -85,13 +86,24 @@ func DataFromBase64URL(text string) ([]byte, bool) {
 	return data, err == nil
 }
 
-// BindingRequestHash is Data(sha256Hex(canonical.base64EncodedString()).utf8) from Binding.
-func BindingRequestHash(request *interop.IdentityEnrollmentRequest) ([]byte, error) {
+// ExtensionRequestHash is SHA-256 of the canonical request, as
+// IdentityLinkProtocolService.requestHash in CellBase.
+func ExtensionRequestHash(request *interop.IdentityEnrollmentRequest) ([]byte, error) {
 	canonical, err := interop.SignedBytes(request)
 	if err != nil {
 		return nil, err
 	}
-	return []byte(SHA256Hex(base64.StdEncoding.EncodeToString(canonical))), nil
+	sum := sha256.Sum256(canonical)
+	return sum[:], nil
+}
+
+// ExtensionHumanCode is the code both screens show: HumanCode of the hex request hash.
+func ExtensionHumanCode(request *interop.IdentityEnrollmentRequest) string {
+	hash, err := ExtensionRequestHash(request)
+	if err != nil {
+		return ""
+	}
+	return HumanCode(hex.EncodeToString(hash))
 }
 
 type outgoingRequest struct {
@@ -265,6 +277,51 @@ func decodeObject(obj map[string]any, model any) bool {
 	return err == nil && interop.Decode(data, model) == nil
 }
 
+// encodeApprovalPackage is Binding's ApprovalPackage: the approval and the key
+// that signed it, as base64url JSON.
+func encodeApprovalPackage(approval any, issuer interop.IdentityPublicKeyDescriptor) string {
+	approvalJSON, err := interop.EncodedJSON(approval)
+	if err != nil {
+		return ""
+	}
+	issuerJSON, err := interop.EncodedJSON(&issuer)
+	if err != nil {
+		return ""
+	}
+	data, err := json.Marshal(map[string]json.RawMessage{"approval": approvalJSON, "issuerIdentity": issuerJSON})
+	if err != nil {
+		return ""
+	}
+	return Base64URL(data)
+}
+
+// decodeApprovalPackage reads `package` (or a bare package string) into approval
+// and returns the issuer key that came with it.
+func decodeApprovalPackage(value any, approval *interop.IdentityEnrollmentApproval) (interop.IdentityPublicKeyDescriptor, bool) {
+	var issuer interop.IdentityPublicKeyDescriptor
+	text := extString(value)
+	if obj, ok := ObjectValue(value); ok {
+		text = extString(obj["package"])
+	}
+	data, ok := DataFromBase64URL(text)
+	if text == "" || !ok {
+		return issuer, false
+	}
+	var body struct {
+		Approval       json.RawMessage `json:"approval"`
+		IssuerIdentity json.RawMessage `json:"issuerIdentity"`
+	}
+	if json.Unmarshal(data, &body) != nil || len(body.Approval) == 0 || len(body.IssuerIdentity) == 0 {
+		return issuer, false
+	}
+	var decoded interop.IdentityEnrollmentApproval
+	if interop.Decode(body.Approval, &decoded) != nil || interop.Decode(body.IssuerIdentity, &issuer) != nil {
+		return issuer, false
+	}
+	*approval = decoded
+	return issuer, true
+}
+
 func encodeTransport(model any) string {
 	data, err := interop.EncodedJSON(model)
 	if err != nil {
@@ -394,7 +451,7 @@ func (c *EntityScaffoldExtensionCell) beginRequest(value any) map[string]any {
 		Type: "signature", ByIdentityUUID: c.opts.Descriptor.UUID, Algorithm: c.opts.Descriptor.Algorithm,
 		CurveType: c.opts.Descriptor.CurveType, Signature: signature,
 	}
-	code := HumanCode(requestID + audience)
+	code := ExtensionHumanCode(request)
 	kept := []*outgoingRequest{{request: request, humanCode: code, createdAt: now}}
 	for _, entry := range c.outgoing {
 		if entry.request.RequestID != requestID {
@@ -472,7 +529,7 @@ func (c *EntityScaffoldExtensionCell) reviewRequest(value any) map[string]any {
 	if request.Platform != nil {
 		platform = *request.Platform
 	}
-	code := HumanCode(request.RequestID + request.Audience)
+	code := ExtensionHumanCode(&request)
 	return map[string]any{
 		"schema":               "haven.entityExtension.review.v1",
 		"status":               status,
@@ -550,7 +607,7 @@ func (c *EntityScaffoldExtensionCell) approveRequest(value any) map[string]any {
 	if len(granted) == 0 {
 		return c.fail(extError("no_scopes", "Ingen rettigheter ble godkjent, så det er ikke noe å koble.", nil))
 	}
-	requestHash, err := BindingRequestHash(&request)
+	requestHash, err := ExtensionRequestHash(&request)
 	if err != nil {
 		return c.fail(extError("bad_payload", "Forespørselen kunne ikke kanoniseres.", nil))
 	}
@@ -617,12 +674,12 @@ func (c *EntityScaffoldExtensionCell) approveRequest(value any) map[string]any {
 		"approvalID":     approval.ApprovalID,
 		"linkID":         record.LinkID,
 		"payload":        encodeTransport(approval),
+		"package":        encodeApprovalPackage(approval, descriptor),
 		"approvedScopes": toAnyStrings(granted),
 		"refusedScopes":  toAnyStrings(refused),
 		"expiresAt":      approval.ExpiresAt,
-		"nextStep":       "Send denne pakken tilbake til den nye enheten og kjør extension.acceptApproval der.",
+		"nextStep":       "Send `package` tilbake til den nye enheten og kjør extension.acceptApproval der. Den har godkjennerens offentlige nøkkel med, så signaturen kan sjekkes.",
 		"links":          c.linkRows(),
-		// Not in Binding: lets the new place check the approver's signature.
 		"issuerIdentity": issuer,
 	})
 	c.lastResult = result
@@ -650,7 +707,8 @@ func (c *EntityScaffoldExtensionCell) signApprovalProof(approval *interop.Identi
 
 func (c *EntityScaffoldExtensionCell) acceptApproval(value any) map[string]any {
 	var approval interop.IdentityEnrollmentApproval
-	if !decodeTransport(value, "approval", &approval) {
+	packageIssuer, fromPackage := decodeApprovalPackage(value, &approval)
+	if !fromPackage && !decodeTransport(value, "approval", &approval) {
 		return c.fail(extError("bad_payload", "Fant ingen gyldig godkjenning i det du sendte.", nil))
 	}
 	var pending *outgoingRequest
@@ -663,7 +721,7 @@ func (c *EntityScaffoldExtensionCell) acceptApproval(value any) map[string]any {
 	if pending == nil {
 		return c.fail(extError("no_matching_request", "Denne godkjenningen hører ikke til noen forespørsel denne enheten har sendt.", nil))
 	}
-	expected, err := BindingRequestHash(pending.request)
+	expected, err := ExtensionRequestHash(pending.request)
 	if err != nil {
 		return c.fail(extError("bad_request", "Den lagrede forespørselen kunne ikke kanoniseres.", nil))
 	}
@@ -674,23 +732,28 @@ func (c *EntityScaffoldExtensionCell) acceptApproval(value any) map[string]any {
 	if expiry, ok := interop.ParseISO8601(approval.ExpiresAt); ok && now.After(expiry) {
 		return c.fail(extError("expired", "Godkjenningen er utløpt. Start forespørselen på nytt.", nil))
 	}
-	signaturePresent := approval.Proof != nil && approval.Proof.Signature != nil
-	// Binding cannot check the approver's signature because it has no key for
-	// it. When the caller hands one over, check it and refuse a bad one.
-	signatureVerified := false
-	if obj, ok := ObjectValue(value); ok {
-		if raw, ok := ObjectValue(obj["issuerIdentity"]); ok {
-			var issuer interop.IdentityPublicKeyDescriptor
-			if decodeObject(raw, &issuer) && approval.Proof != nil && approval.Proof.Signature != nil &&
-				issuer.UUID == approval.IssuerIdentityUUID && issuer.UUID == approval.Proof.IssuerIdentityUUID {
-				if canonical, err := interop.SignedBytes(&approval); err == nil {
-					signatureVerified = interop.VerifySignature(approval.Proof.Signature, canonical, issuer)
-				}
-			}
-			if !signatureVerified {
-				return c.fail(extError("bad_signature", "Signaturen på godkjenningen stemmer ikke med godkjennerens nøkkel. Jeg kobler ingenting.", nil))
+	// The approver's signature must hold. The key comes in `package` from
+	// extension.approveRequest, or next to a bare approval as `issuerIdentity`.
+	issuer, haveIssuer := packageIssuer, fromPackage
+	if !haveIssuer {
+		if obj, ok := ObjectValue(value); ok {
+			if raw, ok := ObjectValue(obj["issuerIdentity"]); ok {
+				haveIssuer = decodeObject(raw, &issuer)
 			}
 		}
+	}
+	if !haveIssuer {
+		return c.fail(extError("missing_issuer_key", "Godkjenningen mangler godkjennerens offentlige nøkkel, så signaturen kan ikke sjekkes. Send hele `package` fra godkjenningen. Jeg kobler ingenting.", nil))
+	}
+	signatureVerified := false
+	if approval.Proof != nil && approval.Proof.Signature != nil &&
+		issuer.UUID == approval.IssuerIdentityUUID && issuer.UUID == approval.Proof.IssuerIdentityUUID {
+		if canonical, err := interop.SignedBytes(&approval); err == nil {
+			signatureVerified = interop.VerifySignature(approval.Proof.Signature, canonical, issuer)
+		}
+	}
+	if !signatureVerified {
+		return c.fail(extError("bad_signature", "Signaturen på godkjenningen stemmer ikke med godkjennerens nøkkel. Jeg kobler ingenting.", nil))
 	}
 	record := &interop.IdentityLinkRecord{
 		LinkID:                   "lnk-" + strings.ToLower(c.opts.NewUUID()),
@@ -712,10 +775,6 @@ func (c *EntityScaffoldExtensionCell) acceptApproval(value any) map[string]any {
 			entry.linkID = record.LinkID
 		}
 	}
-	note := "Forespørselens hash stemmer, og godkjenningen er signert, men denne enheten har ikke godkjennerens offentlige nøkkel og kan derfor ikke sjekke signaturen selv. Bekreft koden muntlig, eller hent nøkkelen fra scaffoldet."
-	if signatureVerified {
-		note = "Forespørselens hash og godkjennerens signatur stemmer."
-	}
 	result := extOK(
 		fmt.Sprintf("Koblet. Dette stedet er nå en del av entiteten din, med %d rettighet(er).", len(approval.ApprovedScopes)),
 		true,
@@ -723,9 +782,9 @@ func (c *EntityScaffoldExtensionCell) acceptApproval(value any) map[string]any {
 			"linkID":             record.LinkID,
 			"approvedScopes":     toAnyStrings(approval.ApprovedScopes),
 			"issuerIdentityUUID": approval.IssuerIdentityUUID,
-			"signaturePresent":   signaturePresent,
-			"signatureVerified":  signatureVerified,
-			"verificationNote":   note,
+			"signaturePresent":   true,
+			"signatureVerified":  true,
+			"verificationNote":   "Forespørselens hash og godkjennerens signatur stemmer.",
 			"links":              c.linkRows(),
 		},
 	)
